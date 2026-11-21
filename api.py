@@ -1053,3 +1053,274 @@ async def get_season_batch_downloads(
                     ep_num,
                     detail_path,
                     False,
+                    alt_dub_ids
+                )
+                streams = stream_res.get("streams", [])
+                resolved_id = stream_res.get("resolved_subject_id") or subject_id
+                if streams:
+                    break
+                await asyncio.sleep(0.4)
+
+            ep_entry: Dict[str, Any] = {
+                "episode": f"{ep_num:02d}",
+            }
+
+            mp4_streams = [s for s in streams if s["format"] == "MP4"]
+            mp4_streams.sort(key=lambda x: x["quality_value"])
+
+            for s in mp4_streams:
+                ep_entry[f"{s['quality']} download"] = {
+                    "size": s["size"],
+                    "link": s["dl_link"],
+                    "headers": s["headers"]
+                }
+
+            if not mp4_streams:
+                for s in streams:
+                    ep_entry[f"{s['quality']} download"] = {
+                        "size": s["size"],
+                        "link": s["dl_link"],
+                        "headers": s["headers"]
+                    }
+
+            en_url = await asyncio.to_thread(engine.get_english_subtitle_url, resolved_id, se, ep_num)
+            if en_url:
+                ep_entry["sinhala subtitle"] = f"{base_url}/sub/{resolved_id}/si.srt?se={se}&ep={ep_num}"
+                ep_entry["english subtitle"] = f"{base_url}/sub/{resolved_id}/en.srt?se={se}&ep={ep_num}"
+            else:
+                ep_entry["sinhala subtitle"] = None
+                ep_entry["english subtitle"] = None
+
+            return ep_entry
+
+    episodes_data = await asyncio.gather(*(fetch_single_episode(ep) for ep in range(1, total_eps + 1)))
+
+    res = {
+        "series": series_title,
+        "season": se,
+        "total_episodes": total_eps,
+        "episodes": episodes_data
+    }
+    set_cache(cache_key, res, ttl_sec=600)
+    return res
+
+# ==========================================
+# MOVIES (OR SINGLE EPISODE): /api/stream/{subject_id}
+# ==========================================
+@app.get("/api/stream/{subject_id}", tags=["Movies & Single Stream"], summary="Get Streams, Sizes, DL Links & Direct EN/SI Subtitles")
+async def get_streams(
+    request: Request,
+    subject_id: str = Path(...),
+    se: int = Query(0, ge=0),
+    ep: int = Query(0, ge=0),
+    detail_path: Optional[str] = Query(None)
+):
+    cache_key = f"stream_full:{subject_id}:{se}:{ep}"
+    cached = get_cache(cache_key)
+    if cached:
+        return cached
+
+    result = engine.get_streams(subject_id, season=se, episode=ep, detail_path=detail_path)
+    streams = result["streams"]
+    resolved_id = result.get("resolved_subject_id") or subject_id
+
+    downloads = [
+        {
+            "quality": s["quality"],
+            "format": s["format"],
+            "size": s["size"],
+            "dl_link": s["dl_link"],
+            "headers": s["headers"],
+        }
+        for s in streams
+    ]
+
+    subtitles_obj = None
+    en_url = engine.get_english_subtitle_url(resolved_id, season=se, episode=ep)
+    if en_url:
+        try:
+            en_srt, si_srt = await build_subtitles_from_english(en_url)
+            set_cache(f"srt_file:en:{resolved_id}:{se}:{ep}", en_srt, ttl_sec=600)
+            set_cache(f"srt_file:si:{resolved_id}:{se}:{ep}", si_srt, ttl_sec=600)
+
+            base_url = get_public_base_url(request)
+            subtitles_obj = {
+                "english": f"{base_url}/sub/{resolved_id}/en.srt?se={se}&ep={ep}",
+                "sinhala": f"{base_url}/sub/{resolved_id}/si.srt?se={se}&ep={ep}",
+            }
+        except Exception:
+            subtitles_obj = None
+
+    res = {
+        "subject_id": subject_id,
+        "title": result.get("title"),
+        "season": se,
+        "episode": ep,
+        "count": len(streams),
+        "streams": streams,
+        "downloads": downloads,
+        "subtitles": subtitles_obj
+    }
+    set_cache(cache_key, res, ttl_sec=600)
+    return res
+
+# ==========================================
+# CACHED SUBTITLE FILE ENDPOINT (10-MIN TTL)
+# ==========================================
+@app.get("/sub/{subject_id}/{lang}.srt", include_in_schema=False)
+async def download_cached_subtitle(
+    subject_id: str,
+    lang: str,
+    se: int = Query(0, ge=0),
+    ep: int = Query(0, ge=0)
+):
+    if lang not in ("en", "si"):
+        raise HTTPException(status_code=404, detail="Invalid subtitle language. Use en.srt or si.srt")
+
+    srt_key = f"srt_file:{lang}:{subject_id}:{se}:{ep}"
+    cached_srt = get_cache(srt_key)
+
+    if not cached_srt:
+        en_url = engine.get_english_subtitle_url(subject_id, season=se, episode=ep)
+        if not en_url:
+            raise HTTPException(status_code=404, detail="No subtitle available for this title")
+        en_srt, si_srt = await build_subtitles_from_english(en_url)
+        set_cache(f"srt_file:en:{subject_id}:{se}:{ep}", en_srt, ttl_sec=600)
+        set_cache(f"srt_file:si:{subject_id}:{se}:{ep}", si_srt, ttl_sec=600)
+        cached_srt = en_srt if lang == "en" else si_srt
+
+    filename = f"{subject_id}_S{se:02d}E{ep:02d}_{lang}.srt" if (se or ep) else f"{subject_id}_{lang}.srt"
+    return Response(
+        content=cached_srt.encode("utf-8"),
+        media_type="application/x-subrip; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+    )
+
+@app.get("/movies", tags=["Search & Discovery"], summary="Browse Recommended Movies")
+def get_movies(
+    page: int = Query(1, ge=1),
+    per_page: int = Query(24, ge=1, le=50),
+    sort: str = Query("RECOMMEND")
+):
+    cache_key = f"movies:{page}:{per_page}:{sort}"
+    cached = get_cache(cache_key)
+    if cached:
+        return cached
+    url = f"{API_BASE}/subject/filter"
+    payload = {"tabId": 2, "filter": {"sort": sort, "genre": "ALL", "country": "ALL", "year": "ALL", "language": "ALL"}, "page": page, "perPage": per_page}
+    sess = engine._new_session()
+    try:
+        resp = sess.post(url, headers={"User-Agent": WEB_USER_AGENT, "Referer": "https://moviebox.ph/"}, json=payload, timeout=20)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail={"error": "Upstream connection failed", "url": url, "exception": str(e)})
+
+    if resp.status_code != 200:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "error": f"Upstream returned HTTP {resp.status_code}",
+                "url": url,
+                "upstream_headers": dict(resp.headers),
+                "upstream_body": resp.text[:600],
+            },
+        )
+    data = resp.json().get("data", {})
+    raw = data.get("items") or data.get("subjects") or []
+    res = {
+        "page": page,
+        "per_page": per_page,
+        "total": data.get("pager", {}).get("totalCount") or len(raw),
+        "items": [
+            {
+                "title": s.get("title"),
+                "subject_id": str(s.get("subjectId")),
+                "detail_path": s.get("detailPath"),
+                "cover": s.get("cover", {}).get("url") if isinstance(s.get("cover"), dict) else None,
+                "rating": s.get("imdbRatingValue"),
+                "year": s.get("releaseDate", "")[:4] if s.get("releaseDate") else None
+            }
+            for s in raw
+        ]
+    }
+    set_cache(cache_key, res, ttl_sec=600)
+    return res
+
+@app.get("/tv-series", tags=["Search & Discovery"], summary="Browse Recommended TV Series")
+def get_tv_series(
+    page: int = Query(1, ge=1),
+    per_page: int = Query(24, ge=1, le=50),
+    sort: str = Query("RECOMMEND")
+):
+    cache_key = f"tv:{page}:{per_page}:{sort}"
+    cached = get_cache(cache_key)
+    if cached:
+        return cached
+    url = f"{API_BASE}/subject/filter"
+    payload = {"tabId": 5, "filter": {"sort": sort, "genre": "ALL", "country": "ALL", "year": "ALL", "language": "ALL"}, "page": page, "perPage": per_page}
+    sess = engine._new_session()
+    try:
+        resp = sess.post(url, headers={"User-Agent": WEB_USER_AGENT, "Referer": "https://moviebox.ph/"}, json=payload, timeout=20)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail={"error": "Upstream connection failed", "url": url, "exception": str(e)})
+
+    if resp.status_code != 200:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "error": f"Upstream returned HTTP {resp.status_code}",
+                "url": url,
+                "upstream_headers": dict(resp.headers),
+                "upstream_body": resp.text[:600],
+            },
+        )
+    data = resp.json().get("data", {})
+    raw = data.get("items") or data.get("subjects") or []
+    res = {
+        "page": page,
+        "per_page": per_page,
+        "total": data.get("pager", {}).get("totalCount") or len(raw),
+        "items": [
+            {
+                "title": s.get("title"),
+                "subject_id": str(s.get("subjectId")),
+                "detail_path": s.get("detailPath"),
+                "cover": s.get("cover", {}).get("url") if isinstance(s.get("cover"), dict) else None,
+                "rating": s.get("imdbRatingValue"),
+                "year": s.get("releaseDate", "")[:4] if s.get("releaseDate") else None
+            }
+            for s in raw
+        ]
+    }
+    set_cache(cache_key, res, ttl_sec=600)
+    return res
+
+@app.get("/home", tags=["Search & Discovery"], summary="Get Homepage Banners & Trending Feeds")
+def get_home():
+    cached = get_cache("home")
+    if cached:
+        return cached
+    url = f"{API_BASE}/home?host=moviebox.ph"
+    sess = engine._new_session()
+    try:
+        resp = sess.get(url, headers={"User-Agent": WEB_USER_AGENT, "Referer": "https://moviebox.ph/"}, timeout=20)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail={"error": "Upstream connection failed", "url": url, "exception": str(e)})
+
+    if resp.status_code != 200:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "error": f"Upstream returned HTTP {resp.status_code}",
+                "url": url,
+                "upstream_headers": dict(resp.headers),
+                "upstream_body": resp.text[:600],
+            },
+        )
+    res = resp.json()
+    set_cache("home", res, ttl_sec=600)
+    return res
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("api:app", host="0.0.0.0", port=port)
