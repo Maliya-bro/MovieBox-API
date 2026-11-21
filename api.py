@@ -35,17 +35,17 @@ if sys.stderr and hasattr(sys.stderr, "reconfigure"):
         pass
 
 API_DESCRIPTION = """
-### APEX API — Movies & Batch TV Series Stream + Sinhala Subtitle Engine (v3.8.0)
+### APEX API — Movies & Batch TV Series Stream + Sinhala Subtitle Engine (v3.9.0)
 
 - **Movies:** `GET /api/stream/{subject_id}`
 - **TV Series Step 1:** `GET /epi/{subject_id}` (Get seasons & episode counts)
-- **TV Series Step 2:** `GET /dl/{subject_id}?se=1` (Batch all episodes with dummy-clip filter, multi-region fallback & EN/SI subtitles)
+- **TV Series Step 2:** `GET /dl/{subject_id}?se=1` (Batch all episodes with Auto-Dub fallback & EN/SI subtitles)
 """
 
 app = FastAPI(
     title="APEX API — MovieBox Stream & Subtitle Engine",
     description=API_DESCRIPTION,
-    version="3.8.0",
+    version="3.9.0",
     docs_url="/docs",
     redoc_url="/redoc",
 )
@@ -126,7 +126,7 @@ def get_public_base_url(request: Request) -> str:
 # ==========================================
 SECRET_KEY_DEFAULT_B64 = "NzZpUmwwN3MweFNOOWpxbUVXQXQ3OUVCSlp1bElRSXNWNjRGWnIyTw=="
 SECRET_KEY_ALT_B64 = "WHFuMm5uTzQxL0w5Mm8xaXVYaFNMSFRiWHZZNFo1Wlo2Mm04bVNMQQ=="
-MODERN_USER_AGENT = "com.community.mbox.in/50020130 (Linux; U; Android 14; en_US; Pixel 8; Build/UD1A.230803.041; Cronet/145.0.7582.0)"
+MODERN_USER_AGENT = "com.community.mbox.in/50020130 (Linux; U; Android 14; en_IN; Pixel 8; Build/UD1A.230803.041; Cronet/145.0.7582.0)"
 WEB_USER_AGENT = "Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Mobile Safari/537.36"
 API_BASE = "https://h5-api.aoneroom.com/wefeed-h5api-bff"
 NATIVE_API_BASE = "https://api3.aoneroom.com"
@@ -164,7 +164,7 @@ def generate_x_client_token(timestamp: int) -> str:
     reversed_ts = ts_str[::-1].encode("utf-8")
     return f"{ts_str},{md5_hex(reversed_ts)}"
 
-def generate_client_info(device_id: str, region: str = "") -> str:
+def generate_client_info(device_id: str) -> str:
     return json.dumps(
         {
             "package_name": "com.community.mbox.in",
@@ -179,8 +179,8 @@ def generate_client_info(device_id: str, region: str = "") -> str:
             "model": "Pixel 8",
             "system_language": "en",
             "net": "NETWORK_WIFI",
-            "region": region,
-            "timezone": "Asia/Singapore",
+            "region": "IN",
+            "timezone": "Asia/Calcutta",
             "sp_code": "",
         },
         separators=(",", ":"),
@@ -229,7 +229,7 @@ def generate_x_tr_signature(method: str, accept: str | None, content_type: str |
     sig_b64 = base64.b64encode(digest).decode("ascii")
     return f"{timestamp}|2|{sig_b64}"
 
-def build_auth_headers(method: str, url: str, body: str | None = None, token: str | None = None, device_id: str | None = None, use_alt_key: bool = False, content_type: str = "application/json", accept: str = "application/json", region: str = "") -> Dict[str, str]:
+def build_auth_headers(method: str, url: str, body: str | None = None, token: str | None = None, device_id: str | None = None, use_alt_key: bool = False, content_type: str = "application/json", accept: str = "application/json") -> Dict[str, str]:
     ts = int(time.time() * 1000)
     dev_id = device_id or generate_device_id()
     headers = {
@@ -239,7 +239,7 @@ def build_auth_headers(method: str, url: str, body: str | None = None, token: st
         "connection": "keep-alive",
         "x-client-token": generate_x_client_token(ts),
         "x-tr-signature": generate_x_tr_signature(method, accept, content_type, url, body, ts, use_alt_key),
-        "x-client-info": generate_client_info(dev_id, region=region),
+        "x-client-info": generate_client_info(dev_id),
         "x-client-status": "0",
     }
     if token:
@@ -447,7 +447,7 @@ class MovieBoxEngine:
         self.bearer_token = token
         return token
 
-    def api_request(self, method: str, path_or_url: str, body_dict: Optional[Dict[str, Any]] = None, use_token: bool = True, retry_auth: bool = True, region: str = "") -> Dict[str, Any]:
+    def api_request(self, method: str, path_or_url: str, body_dict: Optional[Dict[str, Any]] = None, use_token: bool = True, retry_auth: bool = True) -> Dict[str, Any]:
         full_url = path_or_url if path_or_url.startswith(("http://", "https://")) else f"{NATIVE_API_BASE}{path_or_url}"
         if use_token and not self.bearer_token:
             self.bootstrap_token()
@@ -458,7 +458,6 @@ class MovieBoxEngine:
             body=body_str,
             token=self.bearer_token if use_token else None,
             device_id=self.device_id,
-            region=region,
         )
         data_bytes = body_str.encode("utf-8") if body_str is not None else None
         sess = self._new_session()
@@ -480,7 +479,7 @@ class MovieBoxEngine:
 
         if resp.status_code in (401, 441) and retry_auth:
             self.bootstrap_token(force=True)
-            return self.api_request(method, path_or_url, body_dict, use_token, retry_auth=False, region=region)
+            return self.api_request(method, path_or_url, body_dict, use_token, retry_auth=False)
 
         if resp.status_code != 200:
             raise HTTPException(
@@ -587,7 +586,6 @@ class MovieBoxEngine:
         ]
 
     def _is_dummy_notice_video(self, url: str, size_bytes: int) -> bool:
-        # Filter out 0.8MB "Service/Region Restricted" notice clips
         if "/other/" in url and size_bytes > 0 and size_bytes < 5_000_000:
             return True
         if size_bytes > 0 and size_bytes < 2_500_000:
@@ -658,34 +656,24 @@ class MovieBoxEngine:
                 })
         return parsed
 
-    def get_streams(self, subject_id: str, season: int = 0, episode: int = 0, detail_path: Optional[str] = None, raise_if_empty: bool = True) -> Dict[str, Any]:
-        domain_logs = []
-        title = None
-        if detail_path is None:
-            try:
-                details = self.get_details(subject_id)
-                detail_path = details.get("detail_path", "")
-                title = details.get("title")
-            except Exception:
-                detail_path = ""
-
+    def _fetch_streams_for_id(self, target_id: str, season: int, episode: int, detail_path: str) -> List[Dict[str, Any]]:
         token = self.bootstrap_token()
         sess = self._new_session()
         streams: List[Dict[str, Any]] = []
 
-        # 1. Try Web H5 Domains first
+        # 1. Try Web H5 Domains
         for domain in WEB_DOMAINS:
             play_url = (
                 f"{domain}/wefeed-h5api-bff/subject/play?"
-                f"subjectId={subject_id}&se={season}&ep={episode}&detailPath={detail_path}&"
+                f"subjectId={target_id}&se={season}&ep={episode}&detailPath={detail_path}&"
                 f"streamSignType=1&supportCodecs%5Bhevc%5D=1&supportCodecs%5Bh264%5D=1"
             )
-            referer = f"{domain}/movies/{detail_path}?id={subject_id}&type=/movie/detail&detailSe=&detailEp=&lang=en"
+            referer = f"{domain}/movies/{detail_path}?id={target_id}&type=/movie/detail&detailSe=&detailEp=&lang=en"
             headers = {
                 "User-Agent": WEB_USER_AGENT,
                 "Referer": referer,
                 "Accept": "application/json",
-                "x-client-info": '{"timezone":"Asia/Singapore"}',
+                "x-client-info": '{"timezone":"Asia/Calcutta"}',
                 "x-request-lang": "en",
                 "x-vip-restrict": "0",
                 "x-no-high-risk-restrict": "0",
@@ -695,52 +683,66 @@ class MovieBoxEngine:
             try:
                 resp = sess.get(play_url, headers=headers, timeout=12)
                 if resp.status_code != 200:
-                    domain_logs.append({"domain": domain, "status": resp.status_code})
                     continue
                 json_body = resp.json()
                 data = json_body.get("data", {})
                 raw_streams = data.get("streams", [])
                 dash_items = data.get("dash", [])
                 if not raw_streams and not dash_items:
-                    domain_logs.append({"domain": domain, "status": 200, "reason": "Empty streams"})
                     continue
-
                 streams = self._parse_stream_items(raw_streams, dash_items, domain)
                 if streams:
-                    break
-            except Exception as e:
-                domain_logs.append({"domain": domain, "exception": str(e)})
+                    return streams
+            except Exception:
                 continue
 
-        # 2. Fallback to Native Android Mobile API across multiple regions (bypasses region lock & dummy clips)
-        if not streams:
-            for reg in ("", "US", "PH", "SG"):
-                try:
-                    native_path = f"/wefeed-mobile-bff/subject-api/play-info?subjectId={subject_id}&se={season}&ep={episode}"
-                    native_res = self.api_request("GET", native_path, region=reg)
-                    n_data = native_res.get("data", {})
-                    raw_streams = n_data.get("streams", [])
-                    dash_items = n_data.get("dash", [])
-                    streams = self._parse_stream_items(raw_streams, dash_items, "https://123moviesfree.club")
-                    if streams:
-                        break
-                except Exception as e:
-                    domain_logs.append({"source": f"native-{reg or 'global'}", "exception": str(e)})
+        # 2. Try Native Mobile API
+        try:
+            native_path = f"/wefeed-mobile-bff/subject-api/play-info?subjectId={target_id}&se={season}&ep={episode}"
+            native_res = self.api_request("GET", native_path)
+            n_data = native_res.get("data", {})
+            streams = self._parse_stream_items(n_data.get("streams", []), n_data.get("dash", []), "https://123moviesfree.club")
+        except Exception:
+            pass
+
+        return streams
+
+    def get_streams(self, subject_id: str, season: int = 0, episode: int = 0, detail_path: Optional[str] = None, raise_if_empty: bool = True, alt_dub_ids: Optional[List[str]] = None) -> Dict[str, Any]:
+        title = None
+        if detail_path is None:
+            try:
+                details = self.get_details(subject_id)
+                detail_path = details.get("detail_path", "")
+                title = details.get("title")
+                if alt_dub_ids is None:
+                    alt_dub_ids = [d["subject_id"] for d in details.get("dubs", []) if d.get("subject_id") and d["subject_id"] != subject_id]
+            except Exception:
+                detail_path = ""
+
+        used_id = subject_id
+        streams = self._fetch_streams_for_id(subject_id, season, episode, detail_path or "")
+
+        # Auto-fallback to original/alternate dub subject_id if primary ID returned dummy/empty streams
+        if not streams and alt_dub_ids:
+            for alt_id in alt_dub_ids:
+                streams = self._fetch_streams_for_id(alt_id, season, episode, detail_path or "")
+                if streams:
+                    used_id = alt_id
+                    break
 
         if not streams and raise_if_empty:
             raise HTTPException(
                 status_code=502,
                 detail={
-                    "error": "No valid streams resolved (may be geo-restricted or unavailable upstream)",
+                    "error": "No valid streams resolved for this title",
                     "subject_id": subject_id,
                     "season": season,
                     "episode": episode,
-                    "domain_attempts": domain_logs,
                 },
             )
 
         streams.sort(key=lambda s: s["quality_value"], reverse=True)
-        return {"title": title, "streams": streams}
+        return {"title": title, "resolved_subject_id": used_id, "streams": streams}
 
     def get_english_subtitle_url(self, subject_id: str, season: int = 0, episode: int = 0) -> Optional[str]:
         subs: List[Dict[str, Any]] = []
@@ -842,8 +844,8 @@ async def developer_portal():
     <header>
         <div class="title-row">
             <h1>APEX API</h1>
-            <span class="badge">v3.8.0</span>
-            <span class="badge live">● Multi-Region + Dummy Filter</span>
+            <span class="badge">v3.9.0</span>
+            <span class="badge live">● Auto-Dub Fallback</span>
             <span class="badge si">● EN + Sinhala SRT (10m Cache)</span>
         </div>
         <div class="nav-btns">
@@ -912,7 +914,7 @@ def health_check():
     return {
         "status": "ok",
         "api": "APEX API",
-        "version": "3.8.0",
+        "version": "3.9.0",
         "tls_client": "curl_cffi (chrome120)" if cr is not None else "httpx (fallback)",
         "cached_entries": len(RESPONSE_CACHE),
         "rate_limit_per_min": MAX_REQ_PER_MIN
@@ -1028,6 +1030,7 @@ async def get_season_batch_downloads(
     details = engine.get_details(subject_id)
     detail_path = details.get("detail_path", "")
     series_title = details.get("title")
+    alt_dub_ids = [d["subject_id"] for d in details.get("dubs", []) if d.get("subject_id") and d["subject_id"] != subject_id]
 
     seasons_raw = engine.get_episodes(subject_id)
     target_season = next((s for s in seasons_raw if s["season"] == se), None)
@@ -1041,6 +1044,7 @@ async def get_season_batch_downloads(
     async def fetch_single_episode(ep_num: int) -> Dict[str, Any]:
         async with sem:
             streams = []
+            resolved_id = subject_id
             for attempt in range(2):
                 stream_res = await asyncio.to_thread(
                     engine.get_streams,
@@ -1048,272 +1052,4 @@ async def get_season_batch_downloads(
                     se,
                     ep_num,
                     detail_path,
-                    False
-                )
-                streams = stream_res.get("streams", [])
-                if streams:
-                    break
-                await asyncio.sleep(0.4)
-
-            ep_entry: Dict[str, Any] = {
-                "episode": f"{ep_num:02d}",
-            }
-
-            mp4_streams = [s for s in streams if s["format"] == "MP4"]
-            mp4_streams.sort(key=lambda x: x["quality_value"])
-
-            for s in mp4_streams:
-                ep_entry[f"{s['quality']} download"] = {
-                    "size": s["size"],
-                    "link": s["dl_link"],
-                    "headers": s["headers"]
-                }
-
-            if not mp4_streams:
-                for s in streams:
-                    ep_entry[f"{s['quality']} download"] = {
-                        "size": s["size"],
-                        "link": s["dl_link"],
-                        "headers": s["headers"]
-                    }
-
-            en_url = await asyncio.to_thread(engine.get_english_subtitle_url, subject_id, se, ep_num)
-            if en_url:
-                ep_entry["sinhala subtitle"] = f"{base_url}/sub/{subject_id}/si.srt?se={se}&ep={ep_num}"
-                ep_entry["english subtitle"] = f"{base_url}/sub/{subject_id}/en.srt?se={se}&ep={ep_num}"
-            else:
-                ep_entry["sinhala subtitle"] = None
-                ep_entry["english subtitle"] = None
-
-            return ep_entry
-
-    episodes_data = await asyncio.gather(*(fetch_single_episode(ep) for ep in range(1, total_eps + 1)))
-
-    res = {
-        "series": series_title,
-        "season": se,
-        "total_episodes": total_eps,
-        "episodes": episodes_data
-    }
-    set_cache(cache_key, res, ttl_sec=600)
-    return res
-
-# ==========================================
-# MOVIES (OR SINGLE EPISODE): /api/stream/{subject_id}
-# ==========================================
-@app.get("/api/stream/{subject_id}", tags=["Movies & Single Stream"], summary="Get Streams, Sizes, DL Links & Direct EN/SI Subtitles")
-async def get_streams(
-    request: Request,
-    subject_id: str = Path(...),
-    se: int = Query(0, ge=0),
-    ep: int = Query(0, ge=0),
-    detail_path: Optional[str] = Query(None)
-):
-    cache_key = f"stream_full:{subject_id}:{se}:{ep}"
-    cached = get_cache(cache_key)
-    if cached:
-        return cached
-
-    result = engine.get_streams(subject_id, season=se, episode=ep, detail_path=detail_path)
-    streams = result["streams"]
-
-    downloads = [
-        {
-            "quality": s["quality"],
-            "format": s["format"],
-            "size": s["size"],
-            "dl_link": s["dl_link"],
-            "headers": s["headers"],
-        }
-        for s in streams
-    ]
-
-    subtitles_obj = None
-    en_url = engine.get_english_subtitle_url(subject_id, season=se, episode=ep)
-    if en_url:
-        try:
-            en_srt, si_srt = await build_subtitles_from_english(en_url)
-            set_cache(f"srt_file:en:{subject_id}:{se}:{ep}", en_srt, ttl_sec=600)
-            set_cache(f"srt_file:si:{subject_id}:{se}:{ep}", si_srt, ttl_sec=600)
-
-            base_url = get_public_base_url(request)
-            subtitles_obj = {
-                "english": f"{base_url}/sub/{subject_id}/en.srt?se={se}&ep={ep}",
-                "sinhala": f"{base_url}/sub/{subject_id}/si.srt?se={se}&ep={ep}",
-            }
-        except Exception:
-            subtitles_obj = None
-
-    res = {
-        "subject_id": subject_id,
-        "title": result.get("title"),
-        "season": se,
-        "episode": ep,
-        "count": len(streams),
-        "streams": streams,
-        "downloads": downloads,
-        "subtitles": subtitles_obj
-    }
-    set_cache(cache_key, res, ttl_sec=600)
-    return res
-
-# ==========================================
-# CACHED SUBTITLE FILE ENDPOINT (10-MIN TTL)
-# ==========================================
-@app.get("/sub/{subject_id}/{lang}.srt", include_in_schema=False)
-async def download_cached_subtitle(
-    subject_id: str,
-    lang: str,
-    se: int = Query(0, ge=0),
-    ep: int = Query(0, ge=0)
-):
-    if lang not in ("en", "si"):
-        raise HTTPException(status_code=404, detail="Invalid subtitle language. Use en.srt or si.srt")
-
-    srt_key = f"srt_file:{lang}:{subject_id}:{se}:{ep}"
-    cached_srt = get_cache(srt_key)
-
-    if not cached_srt:
-        en_url = engine.get_english_subtitle_url(subject_id, season=se, episode=ep)
-        if not en_url:
-            raise HTTPException(status_code=404, detail="No subtitle available for this title")
-        en_srt, si_srt = await build_subtitles_from_english(en_url)
-        set_cache(f"srt_file:en:{subject_id}:{se}:{ep}", en_srt, ttl_sec=600)
-        set_cache(f"srt_file:si:{subject_id}:{se}:{ep}", si_srt, ttl_sec=600)
-        cached_srt = en_srt if lang == "en" else si_srt
-
-    filename = f"{subject_id}_S{se:02d}E{ep:02d}_{lang}.srt" if (se or ep) else f"{subject_id}_{lang}.srt"
-    return Response(
-        content=cached_srt.encode("utf-8"),
-        media_type="application/x-subrip; charset=utf-8",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
-    )
-
-@app.get("/movies", tags=["Search & Discovery"], summary="Browse Recommended Movies")
-def get_movies(
-    page: int = Query(1, ge=1),
-    per_page: int = Query(24, ge=1, le=50),
-    sort: str = Query("RECOMMEND")
-):
-    cache_key = f"movies:{page}:{per_page}:{sort}"
-    cached = get_cache(cache_key)
-    if cached:
-        return cached
-    url = f"{API_BASE}/subject/filter"
-    payload = {"tabId": 2, "filter": {"sort": sort, "genre": "ALL", "country": "ALL", "year": "ALL", "language": "ALL"}, "page": page, "perPage": per_page}
-    sess = engine._new_session()
-    try:
-        resp = sess.post(url, headers={"User-Agent": WEB_USER_AGENT, "Referer": "https://moviebox.ph/"}, json=payload, timeout=20)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail={"error": "Upstream connection failed", "url": url, "exception": str(e)})
-
-    if resp.status_code != 200:
-        raise HTTPException(
-            status_code=502,
-            detail={
-                "error": f"Upstream returned HTTP {resp.status_code}",
-                "url": url,
-                "upstream_headers": dict(resp.headers),
-                "upstream_body": resp.text[:600],
-            },
-        )
-    data = resp.json().get("data", {})
-    raw = data.get("items") or data.get("subjects") or []
-    res = {
-        "page": page,
-        "per_page": per_page,
-        "total": data.get("pager", {}).get("totalCount") or len(raw),
-        "items": [
-            {
-                "title": s.get("title"),
-                "subject_id": str(s.get("subjectId")),
-                "detail_path": s.get("detailPath"),
-                "cover": s.get("cover", {}).get("url") if isinstance(s.get("cover"), dict) else None,
-                "rating": s.get("imdbRatingValue"),
-                "year": s.get("releaseDate", "")[:4] if s.get("releaseDate") else None
-            }
-            for s in raw
-        ]
-    }
-    set_cache(cache_key, res, ttl_sec=600)
-    return res
-
-@app.get("/tv-series", tags=["Search & Discovery"], summary="Browse Recommended TV Series")
-def get_tv_series(
-    page: int = Query(1, ge=1),
-    per_page: int = Query(24, ge=1, le=50),
-    sort: str = Query("RECOMMEND")
-):
-    cache_key = f"tv:{page}:{per_page}:{sort}"
-    cached = get_cache(cache_key)
-    if cached:
-        return cached
-    url = f"{API_BASE}/subject/filter"
-    payload = {"tabId": 5, "filter": {"sort": sort, "genre": "ALL", "country": "ALL", "year": "ALL", "language": "ALL"}, "page": page, "perPage": per_page}
-    sess = engine._new_session()
-    try:
-        resp = sess.post(url, headers={"User-Agent": WEB_USER_AGENT, "Referer": "https://moviebox.ph/"}, json=payload, timeout=20)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail={"error": "Upstream connection failed", "url": url, "exception": str(e)})
-
-    if resp.status_code != 200:
-        raise HTTPException(
-            status_code=502,
-            detail={
-                "error": f"Upstream returned HTTP {resp.status_code}",
-                "url": url,
-                "upstream_headers": dict(resp.headers),
-                "upstream_body": resp.text[:600],
-            },
-        )
-    data = resp.json().get("data", {})
-    raw = data.get("items") or data.get("subjects") or []
-    res = {
-        "page": page,
-        "per_page": per_page,
-        "total": data.get("pager", {}).get("totalCount") or len(raw),
-        "items": [
-            {
-                "title": s.get("title"),
-                "subject_id": str(s.get("subjectId")),
-                "detail_path": s.get("detailPath"),
-                "cover": s.get("cover", {}).get("url") if isinstance(s.get("cover"), dict) else None,
-                "rating": s.get("imdbRatingValue"),
-                "year": s.get("releaseDate", "")[:4] if s.get("releaseDate") else None
-            }
-            for s in raw
-        ]
-    }
-    set_cache(cache_key, res, ttl_sec=600)
-    return res
-
-@app.get("/home", tags=["Search & Discovery"], summary="Get Homepage Banners & Trending Feeds")
-def get_home():
-    cached = get_cache("home")
-    if cached:
-        return cached
-    url = f"{API_BASE}/home?host=moviebox.ph"
-    sess = engine._new_session()
-    try:
-        resp = sess.get(url, headers={"User-Agent": WEB_USER_AGENT, "Referer": "https://moviebox.ph/"}, timeout=20)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail={"error": "Upstream connection failed", "url": url, "exception": str(e)})
-
-    if resp.status_code != 200:
-        raise HTTPException(
-            status_code=502,
-            detail={
-                "error": f"Upstream returned HTTP {resp.status_code}",
-                "url": url,
-                "upstream_headers": dict(resp.headers),
-                "upstream_body": resp.text[:600],
-            },
-        )
-    res = resp.json()
-    set_cache("home", res, ttl_sec=600)
-    return res
-
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run("api:app", host="0.0.0.0", port=port)
+                    False,
