@@ -8,6 +8,7 @@ import re
 import secrets
 import sys
 import time
+import traceback
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit
 
@@ -33,20 +34,14 @@ if sys.stderr and hasattr(sys.stderr, "reconfigure"):
         pass
 
 API_DESCRIPTION = """
-### Simple & Fast Movie/TV Metadata, Stream & Subtitle API
-
-**Quick 3-Step Workflow:**
-1. **Search:** Call `GET /search?q=Avatar` to find the `subject_id`.
-2. **Resolve Streams:** Call `GET /api/stream/{subject_id}` (add `?se=1&ep=1` for TV series) to get direct MP4/DASH links and required `headers`.
-3. **Fetch Subtitles:** Call `GET /api/stream/{subject_id}/captions` to get `.srt` subtitle files.
-
-> **Important Note on Video Links:** CDN video URLs include a `headers` object (with `Referer`). You must pass those headers when downloading or streaming the video file from your app/bot to prevent HTTP `403`/`429` blocks.
+### MovieBox Developer API (Diagnostic & Testing Edition)
+Every endpoint returns detailed upstream diagnostics (`upstream_status`, `upstream_headers`, `upstream_body`, and `errors`) if an upstream request fails.
 """
 
 app = FastAPI(
     title="MovieBox Developer API",
     description=API_DESCRIPTION,
-    version="3.0.0",
+    version="3.1.0",
     docs_url="/docs",
     redoc_url="/redoc",
 )
@@ -59,12 +54,26 @@ app.add_middleware(
 )
 
 # ==========================================
+# GLOBAL EXCEPTION HANDLER (Shows exact crash cause)
+# ==========================================
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    return JSONResponse(
+        status_code=500,
+        content={
+            "status": "internal_error",
+            "path": str(request.url.path),
+            "error_type": type(exc).__name__,
+            "message": str(exc),
+            "traceback": traceback.format_exc().splitlines()[-5:],
+        },
+    )
+
+# ==========================================
 # SECURITY: RATE LIMITER & IN-MEMORY CACHE
 # ==========================================
 RATE_LIMIT_STORE: Dict[str, List[float]] = defaultdict(list)
 MAX_REQ_PER_MIN = int(os.environ.get("RATE_LIMIT", 40))
-
-# Simple TTL Cache: {key: (expiry_timestamp, data)}
 RESPONSE_CACHE: Dict[str, Tuple[float, Any]] = {}
 
 def get_cache(key: str) -> Optional[Any]:
@@ -79,7 +88,6 @@ def get_cache(key: str) -> Optional[Any]:
 
 def set_cache(key: str, value: Any, ttl_sec: int = 600) -> None:
     if len(RESPONSE_CACHE) > 500:
-        # Clear oldest 100 entries if memory grows
         for k in list(RESPONSE_CACHE.keys())[:100]:
             RESPONSE_CACHE.pop(k, None)
     RESPONSE_CACHE[key] = (time.time() + ttl_sec, value)
@@ -276,14 +284,58 @@ class MovieBoxEngine:
         if self.bearer_token and not force:
             return self.bearer_token
         headers = build_auth_headers("GET", BOOTSTRAP_URL, device_id=self.device_id)
-        resp = self.session.get(BOOTSTRAP_URL, headers=headers, timeout=20)
+        try:
+            resp = self.session.get(BOOTSTRAP_URL, headers=headers, timeout=20)
+        except Exception as e:
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "step": "bootstrap_token",
+                    "error": "Upstream connection exception",
+                    "target_url": BOOTSTRAP_URL,
+                    "tls_client": "curl_cffi" if cr else "httpx",
+                    "exception": str(e),
+                },
+            )
+
         x_user = resp.headers.get("x-user")
         if not x_user:
-            raise HTTPException(status_code=502, detail="Upstream authentication failed")
-        token_data = json.loads(x_user)
-        token = token_data.get("token")
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "step": "bootstrap_token",
+                    "error": "Upstream authentication failed (missing x-user header)",
+                    "target_url": BOOTSTRAP_URL,
+                    "tls_client": "curl_cffi" if cr else "httpx",
+                    "upstream_status": resp.status_code,
+                    "upstream_headers": dict(resp.headers),
+                    "upstream_body": resp.text[:600],
+                },
+            )
+
+        try:
+            token_data = json.loads(x_user)
+            token = token_data.get("token")
+        except Exception as e:
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "step": "bootstrap_token",
+                    "error": "Failed to parse x-user header JSON",
+                    "raw_x_user": x_user[:300],
+                    "exception": str(e),
+                },
+            )
+
         if not token:
-            raise HTTPException(status_code=502, detail="Upstream returned empty session token")
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "step": "bootstrap_token",
+                    "error": "Upstream returned empty session token",
+                    "x_user_data": token_data,
+                },
+            )
         self.bearer_token = token
         return token
 
@@ -300,16 +352,64 @@ class MovieBoxEngine:
             device_id=self.device_id,
         )
         data_bytes = body_str.encode("utf-8") if body_str is not None else None
-        if method.upper() == "POST":
-            resp = self.session.post(full_url, headers=headers, data=data_bytes, timeout=25)
-        else:
-            resp = self.session.get(full_url, headers=headers, timeout=25)
+        try:
+            if method.upper() == "POST":
+                resp = self.session.post(full_url, headers=headers, data=data_bytes, timeout=25)
+            else:
+                resp = self.session.get(full_url, headers=headers, timeout=25)
+        except Exception as e:
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "step": "api_request",
+                    "error": "Upstream API connection failed",
+                    "url": full_url,
+                    "exception": str(e),
+                },
+            )
+
         if resp.status_code in (401, 441) and retry_auth:
             self.bootstrap_token(force=True)
             return self.api_request(method, path_or_url, body_dict, use_token, retry_auth=False)
+
         if resp.status_code != 200:
-            raise HTTPException(status_code=502, detail=f"Upstream server returned HTTP {resp.status_code}")
-        return resp.json()
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "step": "api_request",
+                    "error": f"Upstream server returned HTTP {resp.status_code}",
+                    "url": full_url,
+                    "upstream_status": resp.status_code,
+                    "upstream_headers": dict(resp.headers),
+                    "upstream_body": resp.text[:600],
+                },
+            )
+
+        try:
+            parsed = resp.json()
+        except Exception as e:
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "step": "api_request",
+                    "error": "Invalid JSON returned by upstream server",
+                    "url": full_url,
+                    "upstream_body": resp.text[:600],
+                    "exception": str(e),
+                },
+            )
+
+        if parsed.get("code") not in (0, 200, None):
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "step": "api_request",
+                    "error": "Upstream API returned logical error code",
+                    "url": full_url,
+                    "upstream_json": parsed,
+                },
+            )
+        return parsed
 
     def search(self, query: str, page: int = 1, per_page: int = 20) -> List[Dict[str, Any]]:
         payload = {"keyword": query, "page": page, "perPage": per_page}
@@ -335,7 +435,7 @@ class MovieBoxEngine:
     def get_details(self, subject_id: str) -> Dict[str, Any]:
         data = self.api_request("GET", f"/wefeed-mobile-bff/subject-api/get?subjectId={subject_id}").get("data", {})
         if not data:
-            raise HTTPException(status_code=404, detail="Title not found for given subject_id")
+            raise HTTPException(status_code=404, detail={"error": "Title not found", "subject_id": subject_id})
         detail_url_str = data.get("detailUrl", "")
         detail_path = detail_url_str.split("/")[-1] if "/" in detail_url_str else detail_url_str
         sub_cover = data.get("cover")
@@ -376,13 +476,12 @@ class MovieBoxEngine:
             for s in seasons
         ]
 
-    def get_streams(self, subject_id: str, season: int = 0, episode: int = 0, detail_path: Optional[str] = None) -> List[Dict[str, Any]]:
+    def get_streams(self, subject_id: str, season: int = 0, episode: int = 0, detail_path: Optional[str] = None) -> Dict[str, Any]:
+        domain_logs = []
         if not detail_path:
-            try:
-                details = self.get_details(subject_id)
-                detail_path = details.get("detail_path", "")
-            except Exception:
-                detail_path = ""
+            details = self.get_details(subject_id)
+            detail_path = details.get("detail_path", "")
+
         token = self.bootstrap_token()
         streams: List[Dict[str, Any]] = []
         seen_urls = set()
@@ -408,82 +507,98 @@ class MovieBoxEngine:
             try:
                 resp = self.session.get(play_url, headers=headers, timeout=12)
                 if resp.status_code != 200:
+                    domain_logs.append({"domain": domain, "status": resp.status_code, "body": resp.text[:200]})
                     continue
-                data = resp.json().get("data", {})
+                json_body = resp.json()
+                data = json_body.get("data", {})
                 raw_streams = data.get("streams", [])
                 dash_items = data.get("dash", [])
 
-                if raw_streams or dash_items:
-                    for st in raw_streams:
-                        url = st.get("url")
-                        if not url or url in seen_urls:
-                            continue
-                        seen_urls.add(url)
-                        res_str = str(st.get("resolutions", "unknown"))
-                        size_bytes = int(st.get("size") or 0)
-                        size_mb = size_bytes / (1024 * 1024) if size_bytes else 0
-                        quality_val = 0
-                        for q in (2160, 1440, 1080, 720, 480, 360, 240):
-                            if str(q) in res_str:
-                                quality_val = q
-                                break
+                if not raw_streams and not dash_items:
+                    domain_logs.append({"domain": domain, "status": 200, "reason": "Empty streams array", "upstream_json": json_body})
+                    continue
+
+                for st in raw_streams:
+                    url = st.get("url")
+                    if not url or url in seen_urls:
+                        continue
+                    seen_urls.add(url)
+                    res_str = str(st.get("resolutions", "unknown"))
+                    size_bytes = int(st.get("size") or 0)
+                    size_mb = size_bytes / (1024 * 1024) if size_bytes else 0
+                    quality_val = 0
+                    for q in (2160, 1440, 1080, 720, 480, 360, 240):
+                        if str(q) in res_str:
+                            quality_val = q
+                            break
+                    streams.append({
+                        "quality": f"{quality_val}p" if quality_val else res_str,
+                        "quality_value": quality_val,
+                        "format": st.get("format", "MP4"),
+                        "size_mb": round(size_mb, 1),
+                        "codec": st.get("codecName"),
+                        "duration_sec": st.get("duration"),
+                        "url": url,
+                        "headers": {
+                            "User-Agent": "Mozilla/5.0",
+                            "Referer": f"{domain}/",
+                            "Origin": domain,
+                        }
+                    })
+
+                for d in dash_items:
+                    url = d.get("url")
+                    cookie = d.get("signCookie")
+                    extracted_mpd = extract_policy_resource(cookie) if cookie else None
+                    final_url = extracted_mpd or url
+                    if final_url and final_url not in seen_urls:
+                        seen_urls.add(final_url)
+                        res_tag = str(d.get("resolutions", "adaptive"))
                         streams.append({
-                            "quality": f"{quality_val}p" if quality_val else res_str,
-                            "quality_value": quality_val,
-                            "format": st.get("format", "MP4"),
-                            "size_mb": round(size_mb, 1),
-                            "codec": st.get("codecName"),
-                            "duration_sec": st.get("duration"),
-                            "url": url,
+                            "quality": "1080p (Adaptive)" if "1080" in res_tag else "Adaptive",
+                            "quality_value": 1080 if "1080" in res_tag else 999,
+                            "format": "DASH",
+                            "size_mb": 0,
+                            "codec": "hevc/h264",
+                            "duration_sec": None,
+                            "url": final_url,
+                            "cookie": cookie,
                             "headers": {
                                 "User-Agent": "Mozilla/5.0",
                                 "Referer": f"{domain}/",
                                 "Origin": domain,
                             }
                         })
-
-                    for d in dash_items:
-                        url = d.get("url")
-                        cookie = d.get("signCookie")
-                        extracted_mpd = extract_policy_resource(cookie) if cookie else None
-                        final_url = extracted_mpd or url
-                        if final_url and final_url not in seen_urls:
-                            seen_urls.add(final_url)
-                            res_tag = str(d.get("resolutions", "adaptive"))
-                            streams.append({
-                                "quality": "1080p (Adaptive)" if "1080" in res_tag else "Adaptive",
-                                "quality_value": 1080 if "1080" in res_tag else 999,
-                                "format": "DASH",
-                                "size_mb": 0,
-                                "codec": "hevc/h264",
-                                "duration_sec": None,
-                                "url": final_url,
-                                "cookie": cookie,
-                                "headers": {
-                                    "User-Agent": "Mozilla/5.0",
-                                    "Referer": f"{domain}/",
-                                    "Origin": domain,
-                                }
-                            })
-                    break
-            except Exception:
+                break
+            except Exception as e:
+                domain_logs.append({"domain": domain, "exception": str(e)})
                 continue
 
+        if not streams:
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "error": "No streams resolved from any Web CDN domain",
+                    "subject_id": subject_id,
+                    "season": season,
+                    "episode": episode,
+                    "domain_attempts": domain_logs,
+                },
+            )
+
         streams.sort(key=lambda s: s["quality_value"], reverse=True)
-        return streams
+        return {"streams": streams}
 
     def get_subtitles(self, subject_id: str, stream_id: Optional[str] = None, season: int = 0, episode: int = 0) -> List[Dict[str, Any]]:
         subs: List[Dict[str, Any]] = []
         seen_urls = set()
+        errors = []
 
         if not stream_id:
-            try:
-                native_url = f"/wefeed-mobile-bff/subject-api/play-info?subjectId={subject_id}&se={season}&ep={episode}"
-                raw_streams = self.api_request("GET", native_url).get("data", {}).get("streams", [])
-                if raw_streams and raw_streams[0].get("id"):
-                    stream_id = str(raw_streams[0]["id"])
-            except Exception:
-                pass
+            native_url = f"/wefeed-mobile-bff/subject-api/play-info?subjectId={subject_id}&se={season}&ep={episode}"
+            raw_streams = self.api_request("GET", native_url).get("data", {}).get("streams", [])
+            if raw_streams and raw_streams[0].get("id"):
+                stream_id = str(raw_streams[0]["id"])
 
         def _add_sub(item: Dict[str, Any]):
             u = item.get("url")
@@ -505,8 +620,8 @@ class MovieBoxEngine:
                 for s in captions:
                     if isinstance(s, dict):
                         _add_sub(s)
-            except Exception:
-                pass
+            except Exception as e:
+                errors.append({"source": "get-stream-captions", "detail": getattr(e, "detail", str(e))})
 
         try:
             res_id = stream_id or "0"
@@ -516,8 +631,11 @@ class MovieBoxEngine:
             for s in ext:
                 if isinstance(s, dict):
                     _add_sub(s)
-        except Exception:
-            pass
+        except Exception as e:
+            errors.append({"source": "get-ext-captions", "detail": getattr(e, "detail", str(e))})
+
+        if not subs and errors:
+            raise HTTPException(status_code=502, detail={"error": "Failed to fetch subtitles", "errors": errors})
 
         return subs
 
@@ -533,339 +651,77 @@ async def developer_portal():
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>MovieBox Developer API — Docs & Playground</title>
+    <title>MovieBox Developer API — Docs & Diagnostic Playground</title>
     <style>
         :root {
-            --bg: #09090b;
-            --surface: #111114;
-            --surface-2: #18181c;
-            --border: #27272a;
-            --text: #fafafa;
-            --dim: #a1a1aa;
-            --blue: #3b82f6;
-            --blue-soft: rgba(59, 130, 246, 0.14);
-            --green: #10b981;
-            --green-soft: rgba(16, 185, 129, 0.14);
-            --amber: #f59e0b;
-            --amber-soft: rgba(245, 158, 11, 0.14);
+            --bg: #09090b; --surface: #111114; --surface-2: #18181c; --border: #27272a;
+            --text: #fafafa; --dim: #a1a1aa; --blue: #3b82f6; --green: #10b981;
             --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
             --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
         }
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body { background: var(--bg); color: var(--text); font-family: var(--sans); font-size: 14px; line-height: 1.6; padding: 28px 18px 60px; }
-        .container { max-width: 1020px; margin: 0 auto; display: flex; flex-direction: column; gap: 28px; }
+        .container { max-width: 980px; margin: 0 auto; display: flex; flex-direction: column; gap: 24px; }
         header { display: flex; justify-content: space-between; align-items: center; padding-bottom: 18px; border-bottom: 1px solid var(--border); flex-wrap: wrap; gap: 12px; }
-        .title-row { display: flex; align-items: center; gap: 10px; }
-        .title-row h1 { font-size: 20px; font-weight: 700; letter-spacing: -0.4px; }
-        .badge { font-family: var(--mono); font-size: 11px; padding: 3px 8px; border-radius: 5px; background: var(--surface-2); border: 1px solid var(--border); color: var(--dim); }
-        .badge.live { background: var(--green-soft); border-color: rgba(16,185,129,0.3); color: var(--green); }
-        .nav-btns { display: flex; gap: 8px; }
-        .btn { background: var(--surface-2); color: var(--text); border: 1px solid var(--border); padding: 7px 14px; border-radius: 6px; font-size: 12px; font-weight: 600; cursor: pointer; text-decoration: none; display: inline-flex; align-items: center; gap: 6px; transition: 0.15s; }
-        .btn:hover { background: #222228; border-color: #3f3f46; }
+        .btn { background: var(--surface-2); color: var(--text); border: 1px solid var(--border); padding: 7px 14px; border-radius: 6px; font-size: 12px; font-weight: 600; cursor: pointer; text-decoration: none; display: inline-flex; align-items: center; }
         .btn.primary { background: var(--text); color: var(--bg); border: none; }
-        .btn.primary:hover { opacity: 0.9; }
-        h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.7px; color: var(--dim); margin-bottom: 10px; }
         .card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 20px; }
-        
-        /* Steps Grid */
-        .steps { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px; }
-        .step-box { background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px; padding: 14px; }
-        .step-num { font-family: var(--mono); font-size: 11px; color: var(--blue); font-weight: 700; margin-bottom: 4px; }
-        .step-title { font-weight: 600; font-size: 14px; margin-bottom: 4px; }
-        .step-desc { font-size: 12px; color: var(--dim); }
-        code { font-family: var(--mono); background: #000; padding: 2px 5px; border-radius: 4px; font-size: 12px; color: #e4e4e7; }
-
-        /* Alert Box */
-        .alert { background: var(--amber-soft); border: 1px solid rgba(245, 158, 11, 0.3); border-radius: 8px; padding: 14px 16px; font-size: 13px; color: #fde68a; }
-        .alert strong { color: #fbbf24; }
-
-        /* Tabs for Code Examples */
-        .tabs { display: flex; gap: 6px; margin-bottom: 10px; }
-        .tab { background: transparent; border: 1px solid var(--border); color: var(--dim); padding: 5px 12px; border-radius: 6px; font-size: 12px; cursor: pointer; font-family: var(--mono); }
-        .tab.active { background: var(--blue-soft); border-color: var(--blue); color: var(--blue); font-weight: 600; }
-        pre { background: #070709; border: 1px solid var(--border); border-radius: 8px; padding: 14px; font-family: var(--mono); font-size: 12px; overflow-x: auto; color: #d4d4d8; line-height: 1.5; position: relative; }
-
-        /* Playground */
-        .controls { display: flex; gap: 8px; flex-wrap: wrap; position: relative; }
-        .input { background: var(--bg); border: 1px solid var(--border); color: var(--text); padding: 10px 14px; border-radius: 7px; font-size: 13px; outline: none; }
-        .input:focus { border-color: var(--blue); }
-        .input.grow { flex: 1; min-width: 220px; }
-        .input.small { width: 75px; }
-        .dropdown { position: absolute; top: 44px; left: 0; right: 0; background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px; max-height: 220px; overflow-y: auto; z-index: 30; display: none; }
-        .drop-item { padding: 10px 14px; cursor: pointer; display: flex; justify-content: space-between; border-bottom: 1px solid var(--border); font-size: 13px; }
-        .drop-item:hover { background: #27272a; }
-        .stream-item { display: flex; justify-content: space-between; align-items: center; padding: 10px 12px; border-bottom: 1px solid var(--border); gap: 10px; flex-wrap: wrap; }
-        .stream-item:last-child { border-bottom: none; }
-
-        /* Table */
         table { width: 100%; border-collapse: collapse; }
         th, td { padding: 12px 14px; text-align: left; border-bottom: 1px solid var(--border); font-size: 13px; }
         tr:last-child td { border-bottom: none; }
-        th { font-size: 11px; text-transform: uppercase; color: var(--dim); }
-        .method { font-family: var(--mono); font-size: 11px; font-weight: 700; color: var(--green); background: var(--green-soft); padding: 2px 6px; border-radius: 4px; }
+        code { font-family: var(--mono); background: #000; padding: 2px 6px; border-radius: 4px; font-size: 12px; }
     </style>
 </head>
 <body>
 <div class="container">
     <header>
-        <div class="title-row">
-            <h1>MovieBox Developer API</h1>
-            <span class="badge">v3.0.0</span>
-            <span class="badge live">● Online & Cached</span>
+        <div>
+            <h1 style="font-size: 20px;">MovieBox Developer API <span style="font-size: 12px; color: var(--green);">v3.1.0 (Full Diagnostics)</span></h1>
         </div>
-        <div class="nav-btns">
-            <a href="/health" target="_blank" class="btn">Health Status</a>
-            <a href="/docs" target="_blank" class="btn primary">Interactive Swagger UI ↗</a>
+        <div style="display: flex; gap: 8px;">
+            <a href="/health" target="_blank" class="btn">Health & TLS Check</a>
+            <a href="/docs" target="_blank" class="btn primary">Swagger UI ↗</a>
         </div>
     </header>
-
-    <div>
-        <h2>How It Works (3 Simple Steps)</h2>
-        <div class="steps">
-            <div class="step-box">
-                <div class="step-num">STEP 01</div>
-                <div class="step-title">Find Subject ID</div>
-                <div class="step-desc">Search any movie or TV series using <code>/search?q=Inception</code> to get its unique <code>subject_id</code>.</div>
-            </div>
-            <div class="step-box">
-                <div class="step-num">STEP 02</div>
-                <div class="step-title">Fetch Streams & Headers</div>
-                <div class="step-desc">Call <code>/api/stream/{id}</code> (or <code>?se=1&ep=1</code> for series) to get 1080p/720p/480p URLs + required <code>headers</code>.</div>
-            </div>
-            <div class="step-box">
-                <div class="step-num">STEP 03</div>
-                <div class="step-title">Download or Stream Safely</div>
-                <div class="step-desc">Pass the returned <code>Referer</code> header when downloading or proxying the video URL in your app/bot.</div>
-            </div>
-        </div>
-    </div>
-
-    <div class="alert">
-        <strong>Important for Developers:</strong> Do not open the raw CDN <code>.mp4</code> URLs directly in an empty browser tab without headers—the CDN will return <code>429 Too Many Requests</code> or <code>403 Forbidden</code> due to hotlink protection. Always attach the <code>headers</code> object included in the API response.
-    </div>
-
-    <div>
-        <h2>Quick Copy-Paste Examples</h2>
-        <div class="card">
-            <div class="tabs">
-                <button class="tab active" onclick="showCode('js', this)">Node.js / Fetch</button>
-                <button class="tab" onclick="showCode('py', this)">Python (requests)</button>
-                <button class="tab" onclick="showCode('curl', this)">cURL</button>
-            </div>
-            <pre id="codeBlock"></pre>
-        </div>
-    </div>
-
-    <div>
-        <h2>Live API Playground</h2>
-        <div class="card">
-            <div class="controls">
-                <input type="text" id="qInput" class="input grow" placeholder="Type movie/series name (e.g. Avatar) or paste Subject ID..." autocomplete="off">
-                <input type="number" id="seInput" class="input small" placeholder="S" title="Season (0 for Movie)" value="0">
-                <input type="number" id="epInput" class="input small" placeholder="E" title="Episode (0 for Movie)" value="0">
-                <button class="btn primary" onclick="runTest()">Fetch Streams</button>
-                <div id="dropMenu" class="dropdown"></div>
-            </div>
-            <div id="resultArea" style="margin-top: 14px;"></div>
-        </div>
-    </div>
-
-    <div>
-        <h2>Available REST Endpoints</h2>
-        <div class="card" style="padding: 0; overflow-x: auto;">
-            <table>
-                <thead>
-                    <tr>
-                        <th style="width: 75px;">Method</th>
-                        <th>Endpoint</th>
-                        <th>Description</th>
-                        <th style="width: 95px; text-align: right;">Sample</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    <tr>
-                        <td><span class="method">GET</span></td>
-                        <td><code>/search?q=Avatar</code></td>
-                        <td style="color: var(--dim);">Search movies & TV shows by keyword</td>
-                        <td style="text-align: right;"><a href="/search?q=Avatar" target="_blank" class="btn">Open</a></td>
-                    </tr>
-                    <tr>
-                        <td><span class="method">GET</span></td>
-                        <td><code>/detail/8906247916759695608</code></td>
-                        <td style="color: var(--dim);">Get synopsis, IMDb rating, cover & audio dubs</td>
-                        <td style="text-align: right;"><a href="/detail/8906247916759695608" target="_blank" class="btn">Open</a></td>
-                    </tr>
-                    <tr>
-                        <td><span class="method">GET</span></td>
-                        <td><code>/episodes/6207982430134357800</code></td>
-                        <td style="color: var(--dim);">Get season & episode count for a TV series</td>
-                        <td style="text-align: right;"><a href="/episodes/6207982430134357800" target="_blank" class="btn">Open</a></td>
-                    </tr>
-                    <tr>
-                        <td><span class="method">GET</span></td>
-                        <td><code>/api/stream/8906247916759695608</code></td>
-                        <td style="color: var(--dim);">Get MP4 (1080p/720p/480p) & DASH stream links</td>
-                        <td style="text-align: right;"><a href="/api/stream/8906247916759695608" target="_blank" class="btn">Open</a></td>
-                    </tr>
-                    <tr>
-                        <td><span class="method">GET</span></td>
-                        <td><code>/api/stream/8906247916759695608/captions</code></td>
-                        <td style="color: var(--dim);">Get multi-language subtitle tracks (.srt)</td>
-                        <td style="text-align: right;"><a href="/api/stream/8906247916759695608/captions" target="_blank" class="btn">Open</a></td>
-                    </tr>
-                    <tr>
-                        <td><span class="method">GET</span></td>
-                        <td><code>/movies?page=1</code></td>
-                        <td style="color: var(--dim);">Browse recommended movies</td>
-                        <td style="text-align: right;"><a href="/movies?page=1" target="_blank" class="btn">Open</a></td>
-                    </tr>
-                    <tr>
-                        <td><span class="method">GET</span></td>
-                        <td><code>/tv-series?page=1</code></td>
-                        <td style="color: var(--dim);">Browse recommended TV series</td>
-                        <td style="text-align: right;"><a href="/tv-series?page=1" target="_blank" class="btn">Open</a></td>
-                    </tr>
-                </tbody>
-            </table>
-        </div>
+    <div class="card" style="padding: 0; overflow-x: auto;">
+        <table>
+            <thead><tr><th>Method</th><th>Endpoint</th><th>Description</th><th style="text-align: right;">Test</th></tr></thead>
+            <tbody>
+                <tr><td><code>GET</code></td><td><code>/health</code></td><td>Verify server status & <code>curl_cffi</code> TLS client</td><td style="text-align: right;"><a href="/health" target="_blank" class="btn">Open</a></td></tr>
+                <tr><td><code>GET</code></td><td><code>/search?q=Avatar</code></td><td>Search titles (shows exact upstream error if blocked)</td><td style="text-align: right;"><a href="/search?q=Avatar" target="_blank" class="btn">Open</a></td></tr>
+                <tr><td><code>GET</code></td><td><code>/detail/8906247916759695608</code></td><td>Metadata & audio dubs</td><td style="text-align: right;"><a href="/detail/8906247916759695608" target="_blank" class="btn">Open</a></td></tr>
+                <tr><td><code>GET</code></td><td><code>/episodes/6207982430134357800</code></td><td>TV seasons & episode counts</td><td style="text-align: right;"><a href="/episodes/6207982430134357800" target="_blank" class="btn">Open</a></td></tr>
+                <tr><td><code>GET</code></td><td><code>/api/stream/8906247916759695608</code></td><td>Stream links + per-domain diagnostic logs</td><td style="text-align: right;"><a href="/api/stream/8906247916759695608" target="_blank" class="btn">Open</a></td></tr>
+                <tr><td><code>GET</code></td><td><code>/api/stream/8906247916759695608/captions</code></td><td>Subtitles (.srt) + error trace</td><td style="text-align: right;"><a href="/api/stream/8906247916759695608/captions" target="_blank" class="btn">Open</a></td></tr>
+                <tr><td><code>GET</code></td><td><code>/movies?page=1</code></td><td>Paginated movie catalog</td><td style="text-align: right;"><a href="/movies?page=1" target="_blank" class="btn">Open</a></td></tr>
+                <tr><td><code>GET</code></td><td><code>/tv-series?page=1</code></td><td>Paginated TV series catalog</td><td style="text-align: right;"><a href="/tv-series?page=1" target="_blank" class="btn">Open</a></td></tr>
+                <tr><td><code>GET</code></td><td><code>/home</code></td><td>Homepage trending & banners</td><td style="text-align: right;"><a href="/home" target="_blank" class="btn">Open</a></td></tr>
+            </tbody>
+        </table>
     </div>
 </div>
-
-<script>
-    const BASE = window.location.origin;
-    const snippets = {
-        js: `// 1. Search & Resolve Stream
-const res = await fetch("${BASE}/api/stream/8906247916759695608");
-const data = await res.json();
-
-// 2. Pick 720p or 1080p stream
-const stream = data.streams.find(s => s.quality === "720p") || data.streams[0];
-console.log("Video URL:", stream.url);
-
-// 3. Download/Stream using required Referer header
-const fileRes = await fetch(stream.url, { headers: stream.headers });`,
-        py: `import requests
-
-# 1. Get stream links
-data = requests.get("${BASE}/api/stream/8906247916759695608").json()
-stream = data["streams"][0]
-
-# 2. Download video with required Referer header
-with requests.get(stream["url"], headers=stream["headers"], stream=True) as r:
-    with open("movie.mp4", "wb") as f:
-        for chunk in r.iter_content(chunk_size=8192):
-            f.write(chunk)`,
-        curl: `# Get JSON stream response
-curl -s "${BASE}/api/stream/8906247916759695608" | jq .
-
-# Download MP4 using Referer header
-curl -L -H "Referer: https://123moviesfree.club/" -o video.mp4 "STREAM_URL_HERE"`
-    };
-
-    function showCode(lang, btn) {
-        document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-        if (btn) btn.classList.add('active');
-        document.getElementById('codeBlock').textContent = snippets[lang];
-    }
-    showCode('js');
-
-    let timer = null;
-    let selectedId = "";
-    const qInput = document.getElementById("qInput");
-    const dropMenu = document.getElementById("dropMenu");
-
-    qInput.addEventListener("input", (e) => {
-        clearTimeout(timer);
-        const val = e.target.value.trim();
-        if (val.length < 2) { dropMenu.style.display = "none"; return; }
-        if (/^\\d{15,}$/.test(val)) { selectedId = val; dropMenu.style.display = "none"; return; }
-        timer = setTimeout(async () => {
-            try {
-                const res = await fetch(`/search/suggest?q=${encodeURIComponent(val)}`);
-                const data = await res.json();
-                const items = data.suggestions || [];
-                if (!items.length) { dropMenu.style.display = "none"; return; }
-                dropMenu.innerHTML = items.map(i => `
-                    <div class="drop-item" onclick="pick('${i.subject_id}', '${i.title.replace(/'/g, "\\\\'")}')">
-                        <span>${i.title}</span>
-                        <span style="font-family: var(--mono); color: var(--dim); font-size: 11px;">${i.subject_id}</span>
-                    </div>
-                `).join("");
-                dropMenu.style.display = "block";
-            } catch (e) {}
-        }, 250);
-    });
-
-    function pick(id, title) {
-        selectedId = id;
-        qInput.value = title;
-        dropMenu.style.display = "none";
-        runTest();
-    }
-
-    async function runTest() {
-        const val = qInput.value.trim();
-        const id = /^\\d{15,}$/.test(val) ? val : (selectedId || val);
-        const se = parseInt(document.getElementById("seInput").value) || 0;
-        const ep = parseInt(document.getElementById("epInput").value) || 0;
-        if (!id) return;
-
-        const area = document.getElementById("resultArea");
-        area.innerHTML = '<div style="color: var(--dim);">Resolving streams from API...</div>';
-
-        try {
-            const endpoint = `/api/stream/${id}?se=${se}&ep=${ep}`;
-            const data = await fetch(endpoint).then(r => r.json());
-            const streams = data.streams || [];
-            if (!streams.length) {
-                area.innerHTML = '<div style="color: var(--dim);">No streams found. Make sure you entered a valid Subject ID.</div>';
-                return;
-            }
-            area.innerHTML = `
-                <div style="margin-bottom: 10px; display: flex; justify-content: space-between; align-items: center;">
-                    <span style="font-family: var(--mono); font-size: 12px; color: var(--green);">GET ${endpoint} (${streams.length} streams)</span>
-                    <a href="${endpoint}" target="_blank" class="btn">View Full JSON ↗</a>
-                </div>
-                <div style="border: 1px solid var(--border); border-radius: 8px; background: var(--bg);">
-                    ${streams.map(s => `
-                        <div class="stream-item">
-                            <div style="display: flex; align-items: center; gap: 10px;">
-                                <span class="badge live">${s.quality}</span>
-                                <strong>${s.format}</strong>
-                                <span style="color: var(--dim); font-size: 12px;">${s.size_mb ? s.size_mb + ' MB' : 'Adaptive'}</span>
-                            </div>
-                            <button class="btn" onclick="navigator.clipboard.writeText('${s.url}'); alert('Stream URL Copied!')">Copy CDN URL</button>
-                        </div>
-                    `).join("")}
-                </div>
-            `;
-        } catch (err) {
-            area.innerHTML = `<div style="color: #ef4444;">Request failed: ${err.message}</div>`;
-        }
-    }
-</script>
 </body>
-</html>
-"""
+</html>"""
     return HTMLResponse(content=html_content)
 
 # ==========================================
-# PUBLIC REST ENDPOINTS
+# PUBLIC REST ENDPOINTS (WITH FULL ERROR REPORTING)
 # ==========================================
-@app.get("/health", tags=["System"], summary="Check API Server Health")
+@app.get("/health", tags=["System"], summary="Check API Server Health & TLS Client")
 def health_check():
     return {
         "status": "ok",
-        "version": "3.0.0",
+        "version": "3.1.0",
+        "tls_client": "curl_cffi (chrome120)" if cr is not None else "httpx (fallback - no TLS impersonation)",
         "cached_entries": len(RESPONSE_CACHE),
         "rate_limit_per_min": MAX_REQ_PER_MIN
     }
 
 @app.get("/search", tags=["Search & Discovery"], summary="Search Movies & TV Series")
 def search(
-    q: str = Query(..., min_length=1, description="Movie or TV show title (e.g. Avatar)"),
-    page: int = Query(1, ge=1, description="Page number"),
-    per_page: int = Query(20, ge=1, le=50, description="Results per page")
+    q: str = Query(..., min_length=1),
+    page: int = Query(1, ge=1),
+    per_page: int = Query(20, ge=1, le=50)
 ):
     cache_key = f"search:{q.lower()}:{page}:{per_page}"
     cached = get_cache(cache_key)
@@ -876,7 +732,7 @@ def search(
     return res
 
 @app.get("/search/suggest", tags=["Search & Discovery"], summary="Live Search Autocomplete")
-def search_suggest(q: str = Query(..., min_length=1, description="Partial search keyword")):
+def search_suggest(q: str = Query(..., min_length=1)):
     cache_key = f"suggest:{q.lower()}"
     cached = get_cache(cache_key)
     if cached:
@@ -885,23 +741,34 @@ def search_suggest(q: str = Query(..., min_length=1, description="Partial search
     headers = {"User-Agent": WEB_USER_AGENT, "Referer": "https://moviebox.ph/"}
     try:
         resp = engine.session.post(url, headers=headers, json={"keyword": q, "perPage": 10}, timeout=15)
-        raw = resp.json().get("data", {}).get("items", [])
-    except Exception:
-        raw = []
-    suggestions = []
-    for item in raw:
-        sub = item.get("subject") or {}
-        suggestions.append({
-            "title": sub.get("title") or item.get("word") or item.get("title"),
+    except Exception as e:
+        raise HTTPException(status_code=502, detail={"error": "Upstream connection failed", "url": url, "exception": str(e)})
+
+    if resp.status_code != 200:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "error": f"Upstream returned HTTP {resp.status_code}",
+                "url": url,
+                "upstream_headers": dict(resp.headers),
+                "upstream_body": resp.text[:600],
+            },
+        )
+    raw = resp.json().get("data", {}).get("items", [])
+    suggestions = [
+        {
+            "title": (sub := item.get("subject") or {}).get("title") or item.get("word") or item.get("title"),
             "slug": sub.get("detailPath") or item.get("detailPath"),
             "subject_id": str(sub.get("subjectId") or item.get("subjectId"))
-        })
+        }
+        for item in raw
+    ]
     res = {"suggestions": suggestions}
     set_cache(cache_key, res, ttl_sec=600)
     return res
 
 @app.get("/detail/{subject_id}", tags=["Metadata & Episodes"], summary="Get Full Metadata & Audio Dubs")
-def get_detail(subject_id: str = Path(..., description="Unique subject_id from search")):
+def get_detail(subject_id: str = Path(...)):
     cache_key = f"detail:{subject_id}"
     cached = get_cache(cache_key)
     if cached:
@@ -911,7 +778,7 @@ def get_detail(subject_id: str = Path(..., description="Unique subject_id from s
     return res
 
 @app.get("/episodes/{subject_id}", tags=["Metadata & Episodes"], summary="Get TV Series Seasons & Episodes")
-def get_episodes(subject_id: str = Path(..., description="Unique subject_id of a TV series")):
+def get_episodes(subject_id: str = Path(...)):
     cache_key = f"episodes:{subject_id}"
     cached = get_cache(cache_key)
     if cached:
@@ -922,16 +789,17 @@ def get_episodes(subject_id: str = Path(..., description="Unique subject_id of a
 
 @app.get("/api/stream/{subject_id}", tags=["Streams & Subtitles"], summary="Resolve Direct MP4 & DASH Stream Links")
 def get_streams(
-    subject_id: str = Path(..., description="Unique subject_id"),
-    se: int = Query(0, ge=0, description="Season number (use 0 for Movies)"),
-    ep: int = Query(0, ge=0, description="Episode number (use 0 for Movies)"),
-    detail_path: Optional[str] = Query(None, description="Optional slug for faster lookup")
+    subject_id: str = Path(...),
+    se: int = Query(0, ge=0),
+    ep: int = Query(0, ge=0),
+    detail_path: Optional[str] = Query(None)
 ):
     cache_key = f"stream:{subject_id}:{se}:{ep}"
     cached = get_cache(cache_key)
     if cached:
         return cached
-    streams = engine.get_streams(subject_id, season=se, episode=ep, detail_path=detail_path)
+    result = engine.get_streams(subject_id, season=se, episode=ep, detail_path=detail_path)
+    streams = result["streams"]
     res = {
         "subject_id": subject_id,
         "season": se,
@@ -939,16 +807,15 @@ def get_streams(
         "count": len(streams),
         "streams": streams
     }
-    if streams:
-        set_cache(cache_key, res, ttl_sec=300)
+    set_cache(cache_key, res, ttl_sec=300)
     return res
 
 @app.get("/api/stream/{subject_id}/captions", tags=["Streams & Subtitles"], summary="Get Multi-Language Subtitles (.srt)")
 def get_captions(
-    subject_id: str = Path(..., description="Unique subject_id"),
-    se: int = Query(0, ge=0, description="Season number (0 for Movies)"),
-    ep: int = Query(0, ge=0, description="Episode number (0 for Movies)"),
-    stream_id: Optional[str] = Query(None, description="Optional specific stream ID")
+    subject_id: str = Path(...),
+    se: int = Query(0, ge=0),
+    ep: int = Query(0, ge=0),
+    stream_id: Optional[str] = Query(None)
 ):
     cache_key = f"captions:{subject_id}:{se}:{ep}"
     cached = get_cache(cache_key)
@@ -970,7 +837,7 @@ def get_captions(
 def get_movies(
     page: int = Query(1, ge=1),
     per_page: int = Query(24, ge=1, le=50),
-    sort: str = Query("RECOMMEND", description="Sort order: RECOMMEND, NEWEST, POPULAR")
+    sort: str = Query("RECOMMEND")
 ):
     cache_key = f"movies:{page}:{per_page}:{sort}"
     cached = get_cache(cache_key)
@@ -978,7 +845,21 @@ def get_movies(
         return cached
     url = f"{API_BASE}/subject/filter"
     payload = {"tabId": 2, "filter": {"sort": sort, "genre": "ALL", "country": "ALL", "year": "ALL", "language": "ALL"}, "page": page, "perPage": per_page}
-    resp = engine.session.post(url, headers={"User-Agent": WEB_USER_AGENT, "Referer": "https://moviebox.ph/"}, json=payload, timeout=20)
+    try:
+        resp = engine.session.post(url, headers={"User-Agent": WEB_USER_AGENT, "Referer": "https://moviebox.ph/"}, json=payload, timeout=20)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail={"error": "Upstream connection failed", "url": url, "exception": str(e)})
+
+    if resp.status_code != 200:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "error": f"Upstream returned HTTP {resp.status_code}",
+                "url": url,
+                "upstream_headers": dict(resp.headers),
+                "upstream_body": resp.text[:600],
+            },
+        )
     data = resp.json().get("data", {})
     raw = data.get("items") or data.get("subjects") or []
     res = {
@@ -1004,7 +885,7 @@ def get_movies(
 def get_tv_series(
     page: int = Query(1, ge=1),
     per_page: int = Query(24, ge=1, le=50),
-    sort: str = Query("RECOMMEND", description="Sort order: RECOMMEND, NEWEST, POPULAR")
+    sort: str = Query("RECOMMEND")
 ):
     cache_key = f"tv:{page}:{per_page}:{sort}"
     cached = get_cache(cache_key)
@@ -1012,7 +893,21 @@ def get_tv_series(
         return cached
     url = f"{API_BASE}/subject/filter"
     payload = {"tabId": 5, "filter": {"sort": sort, "genre": "ALL", "country": "ALL", "year": "ALL", "language": "ALL"}, "page": page, "perPage": per_page}
-    resp = engine.session.post(url, headers={"User-Agent": WEB_USER_AGENT, "Referer": "https://moviebox.ph/"}, json=payload, timeout=20)
+    try:
+        resp = engine.session.post(url, headers={"User-Agent": WEB_USER_AGENT, "Referer": "https://moviebox.ph/"}, json=payload, timeout=20)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail={"error": "Upstream connection failed", "url": url, "exception": str(e)})
+
+    if resp.status_code != 200:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "error": f"Upstream returned HTTP {resp.status_code}",
+                "url": url,
+                "upstream_headers": dict(resp.headers),
+                "upstream_body": resp.text[:600],
+            },
+        )
     data = resp.json().get("data", {})
     raw = data.get("items") or data.get("subjects") or []
     res = {
@@ -1040,7 +935,21 @@ def get_home():
     if cached:
         return cached
     url = f"{API_BASE}/home?host=moviebox.ph"
-    resp = engine.session.get(url, headers={"User-Agent": WEB_USER_AGENT, "Referer": "https://moviebox.ph/"}, timeout=20)
+    try:
+        resp = engine.session.get(url, headers={"User-Agent": WEB_USER_AGENT, "Referer": "https://moviebox.ph/"}, timeout=20)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail={"error": "Upstream connection failed", "url": url, "exception": str(e)})
+
+    if resp.status_code != 200:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "error": f"Upstream returned HTTP {resp.status_code}",
+                "url": url,
+                "upstream_headers": dict(resp.headers),
+                "upstream_body": resp.text[:600],
+            },
+        )
     res = resp.json()
     set_cache("home", res, ttl_sec=600)
     return res
