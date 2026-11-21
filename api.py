@@ -1,3 +1,4 @@
+import asyncio
 import base64
 from collections import defaultdict
 import hashlib
@@ -15,7 +16,7 @@ from urllib.parse import quote, urlsplit
 import httpx
 from fastapi import FastAPI, HTTPException, Path, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 try:
     from curl_cffi import requests as cr
@@ -34,20 +35,16 @@ if sys.stderr and hasattr(sys.stderr, "reconfigure"):
         pass
 
 API_DESCRIPTION = """
-### MovieBox Developer API (v3.2.0)
+### APEX API — MovieBox Metadata, Streams & Auto-Translated Sinhala Subtitles
 
-**Quick 3-Step Workflow:**
-1. **Search:** Call `GET /search?q=Avatar` to get the `subject_id`.
-2. **Resolve Streams:** Call `GET /api/stream/{subject_id}` (add `?se=1&ep=1` for TV series).
-3. **Play or Download:**
-   - Use **`proxy_url`** or **`download_url`** directly in any browser, `<video>` tag, or bot **without needing custom headers** (powered by Cloudflare Edge Proxy).
-   - Or use **`url`** directly with the provided **`headers`** object.
+- **Streams:** Returns available qualities (`1080p`, `720p`, `480p`), exact file sizes, and direct CDN download links (`dl_link`) with required headers.
+- **Subtitles:** Automatically filters **English** and **Sinhala** tracks only. If Sinhala is unavailable upstream, auto-translates the English `.srt` into Sinhala with a yellow intro watermark (`00:00:01 --> 00:00:03`).
 """
 
 app = FastAPI(
-    title="MovieBox Developer API",
+    title="APEX API — MovieBox Stream & Subtitle Engine",
     description=API_DESCRIPTION,
-    version="3.2.0",
+    version="3.4.0",
     docs_url="/docs",
     redoc_url="/redoc",
 )
@@ -121,11 +118,6 @@ async def rate_limit_middleware(request: Request, call_next):
 # ==========================================
 # CONFIGURATION & SIGNING ENGINE
 # ==========================================
-WORKER_PROXY_URL = os.environ.get(
-    "WORKER_PROXY_URL",
-    "https://mbox-proxy.malindunadith52.workers.dev"
-).rstrip("/")
-
 SECRET_KEY_DEFAULT_B64 = "NzZpUmwwN3MweFNOOWpxbUVXQXQ3OUVCSlp1bElRSXNWNjRGWnIyTw=="
 SECRET_KEY_ALT_B64 = "WHFuMm5uTzQxL0w5Mm8xaXVYaFNMSFRiWHZZNFo1Wlo2Mm04bVNMQQ=="
 MODERN_USER_AGENT = "com.community.mbox.in/50020130 (Linux; U; Android 14; en_IN; Pixel 8; Build/UD1A.230803.041; Cronet/145.0.7582.0)"
@@ -274,6 +266,106 @@ def extract_policy_resource(sign_cookie: str | None) -> str | None:
                 pass
     return None
 
+def format_human_size(size_bytes: int) -> str:
+    if not size_bytes or size_bytes <= 0:
+        return "Adaptive"
+    mb = size_bytes / (1024 * 1024)
+    if mb >= 1024:
+        return f"{mb / 1024:.2f} GB"
+    return f"{mb:.1f} MB"
+
+# ==========================================
+# SINHALA SUBTITLE TRANSLATOR & WATERMARK
+# ==========================================
+async def _translate_chunk(client: httpx.AsyncClient, lines: List[str]) -> List[str]:
+    joined = "\n|||\n".join(lines)
+    url = "https://translate.googleapis.com/translate_a/single"
+    params = {
+        "client": "gtx",
+        "sl": "en",
+        "tl": "si",
+        "dt": "t",
+        "q": joined,
+    }
+    try:
+        resp = await client.get(url, params=params, timeout=15)
+        if resp.status_code == 200:
+            data = resp.json()
+            translated_full = "".join(seg[0] for seg in data[0] if seg and seg[0])
+            parts = [p.strip() for p in translated_full.split("|||")]
+            if len(parts) == len(lines):
+                return parts
+    except Exception:
+        pass
+    return lines
+
+async def translate_srt_to_sinhala(en_srt_url: str) -> str:
+    async with httpx.AsyncClient(timeout=25, follow_redirects=True) as client:
+        resp = await client.get(en_srt_url, headers={"User-Agent": "Mozilla/5.0"})
+        if resp.status_code != 200:
+            raise HTTPException(status_code=502, detail=f"Failed to download English SRT (HTTP {resp.status_code})")
+        raw_srt = resp.text.lstrip("\ufeff")
+
+    blocks = re.split(r"\r?\n\r?\n", raw_srt.strip())
+    parsed_blocks = []
+    texts_to_translate = []
+
+    for blk in blocks:
+        lines = [l.rstrip("\r") for l in blk.split("\n")]
+        if len(lines) >= 3 and "-->" in lines[1]:
+            idx_line = lines[0].strip()
+            time_line = lines[1].strip()
+            body_text = " ".join(lines[2:]).strip()
+            clean_body = re.sub(r"<[^>]+>", "", body_text).strip()
+            parsed_blocks.append((idx_line, time_line, clean_body))
+            texts_to_translate.append(clean_body)
+        elif len(lines) >= 2 and "-->" in lines[0]:
+            time_line = lines[0].strip()
+            body_text = " ".join(lines[1:]).strip()
+            clean_body = re.sub(r"<[^>]+>", "", body_text).strip()
+            parsed_blocks.append((str(len(parsed_blocks) + 1), time_line, clean_body))
+            texts_to_translate.append(clean_body)
+
+    # Batch translate in chunks of 35 lines concurrently
+    chunk_size = 35
+    chunks = [texts_to_translate[i:i + chunk_size] for i in range(0, len(texts_to_translate), chunk_size)]
+    translated_texts: List[str] = []
+
+    async with httpx.AsyncClient(timeout=20) as t_client:
+        sem = asyncio.Semaphore(5)
+        async def bounded_translate(c):
+            async with sem:
+                return await _translate_chunk(t_client, c)
+
+        results = await asyncio.gather(*(bounded_translate(c) for c in chunks))
+        for res_list in results:
+            translated_texts.extend(res_list)
+
+    # Build final Sinhala SRT with Yellow Watermark at 00:00:01,000 --> 00:00:03,000
+    watermark_block = (
+        "1\n"
+        "00:00:01,000 --> 00:00:03,000\n"
+        '<font color="#FFFF00"><b>APEX API TRANSLATE - POWERED BY MALIYA-MD</b></font>'
+    )
+    out_blocks = [watermark_block]
+
+    for i, (_, time_line, _) in enumerate(parsed_blocks):
+        si_text = translated_texts[i] if i < len(translated_texts) else ""
+        if not si_text:
+            continue
+        # Shift subtitle index by +1 so watermark is #1
+        # Avoid overlapping at 00:00:01 - 00:00:03 if first cue starts at 00:00:00
+        if i == 0 and time_line.startswith("00:00:00"):
+            parts = time_line.split("-->")
+            if len(parts) == 2:
+                time_line = f"00:00:03,100 --> {parts[1].strip()}"
+        out_blocks.append(f"{i + 2}\n{time_line}\n{si_text}")
+
+    return "\n\n".join(out_blocks) + "\n"
+
+# ==========================================
+# CORE MOVIEBOX ENGINE
+# ==========================================
 class MovieBoxEngine:
     _instance = None
 
@@ -489,15 +581,13 @@ class MovieBoxEngine:
 
     def get_streams(self, subject_id: str, season: int = 0, episode: int = 0, detail_path: Optional[str] = None) -> Dict[str, Any]:
         domain_logs = []
-        clean_title = "movie"
-        try:
-            details = self.get_details(subject_id)
-            if not detail_path:
+        title = None
+        if not detail_path:
+            try:
+                details = self.get_details(subject_id)
                 detail_path = details.get("detail_path", "")
-            raw_title = details.get("title") or "movie"
-            clean_title = re.sub(r"[^a-zA-Z0-9_-]", "_", raw_title).strip("_") or "movie"
-        except Exception:
-            if not detail_path:
+                title = details.get("title")
+            except Exception:
                 detail_path = ""
 
         token = self.bootstrap_token()
@@ -536,8 +626,6 @@ class MovieBoxEngine:
                     domain_logs.append({"domain": domain, "status": 200, "reason": "Empty streams array", "upstream_json": json_body})
                     continue
 
-                encoded_ref = quote(f"{domain}/", safe="")
-
                 for st in raw_streams:
                     url = st.get("url")
                     if not url or url in seen_urls:
@@ -545,7 +633,7 @@ class MovieBoxEngine:
                     seen_urls.add(url)
                     res_str = str(st.get("resolutions", "unknown"))
                     size_bytes = int(st.get("size") or 0)
-                    size_mb = size_bytes / (1024 * 1024) if size_bytes else 0
+                    size_mb = round(size_bytes / (1024 * 1024), 1) if size_bytes else 0
                     quality_val = 0
                     for q in (2160, 1440, 1080, 720, 480, 360, 240):
                         if str(q) in res_str:
@@ -553,20 +641,15 @@ class MovieBoxEngine:
                             break
 
                     q_label = f"{quality_val}p" if quality_val else res_str
-                    encoded_u = quote(url, safe="")
-                    ep_tag = f"_S{season:02d}E{episode:02d}" if (season or episode) else ""
-                    dl_filename = f"{clean_title}{ep_tag}_{q_label}.mp4"
-
                     streams.append({
                         "quality": q_label,
                         "quality_value": quality_val,
                         "format": st.get("format", "MP4"),
-                        "size_mb": round(size_mb, 1),
+                        "size": format_human_size(size_bytes),
+                        "size_mb": size_mb,
                         "codec": st.get("codecName"),
                         "duration_sec": st.get("duration"),
-                        "url": url,
-                        "proxy_url": f"{WORKER_PROXY_URL}/?url={encoded_u}&referer={encoded_ref}",
-                        "download_url": f"{WORKER_PROXY_URL}/?filename={quote(dl_filename)}&url={encoded_u}&referer={encoded_ref}",
+                        "dl_link": url,
                         "headers": {
                             "User-Agent": "Mozilla/5.0",
                             "Referer": f"{domain}/",
@@ -582,16 +665,15 @@ class MovieBoxEngine:
                     if final_url and final_url not in seen_urls:
                         seen_urls.add(final_url)
                         res_tag = str(d.get("resolutions", "adaptive"))
-                        encoded_u = quote(final_url, safe="")
                         streams.append({
                             "quality": "1080p (Adaptive)" if "1080" in res_tag else "Adaptive",
                             "quality_value": 1080 if "1080" in res_tag else 999,
                             "format": "DASH",
+                            "size": "Adaptive",
                             "size_mb": 0,
                             "codec": "hevc/h264",
                             "duration_sec": None,
-                            "url": final_url,
-                            "proxy_url": f"{WORKER_PROXY_URL}/?url={encoded_u}&referer={encoded_ref}",
+                            "dl_link": final_url,
                             "cookie": cookie,
                             "headers": {
                                 "User-Agent": "Mozilla/5.0",
@@ -617,18 +699,20 @@ class MovieBoxEngine:
             )
 
         streams.sort(key=lambda s: s["quality_value"], reverse=True)
-        return {"streams": streams}
+        return {"title": title, "streams": streams}
 
-    def get_subtitles(self, subject_id: str, stream_id: Optional[str] = None, season: int = 0, episode: int = 0) -> List[Dict[str, Any]]:
+    def get_raw_subtitles(self, subject_id: str, stream_id: Optional[str] = None, season: int = 0, episode: int = 0) -> List[Dict[str, Any]]:
         subs: List[Dict[str, Any]] = []
         seen_urls = set()
-        errors = []
 
         if not stream_id:
-            native_url = f"/wefeed-mobile-bff/subject-api/play-info?subjectId={subject_id}&se={season}&ep={episode}"
-            raw_streams = self.api_request("GET", native_url).get("data", {}).get("streams", [])
-            if raw_streams and raw_streams[0].get("id"):
-                stream_id = str(raw_streams[0]["id"])
+            try:
+                native_url = f"/wefeed-mobile-bff/subject-api/play-info?subjectId={subject_id}&se={season}&ep={episode}"
+                raw_streams = self.api_request("GET", native_url).get("data", {}).get("streams", [])
+                if raw_streams and raw_streams[0].get("id"):
+                    stream_id = str(raw_streams[0]["id"])
+            except Exception:
+                pass
 
         def _add_sub(item: Dict[str, Any]):
             u = item.get("url")
@@ -637,7 +721,7 @@ class MovieBoxEngine:
                 subs.append({
                     "id": str(item.get("id", "")),
                     "language": item.get("lanName") or item.get("language") or "English",
-                    "code": item.get("lan", ""),
+                    "code": (item.get("lan") or "").lower(),
                     "url": u,
                     "size": item.get("size")
                 })
@@ -650,8 +734,8 @@ class MovieBoxEngine:
                 for s in captions:
                     if isinstance(s, dict):
                         _add_sub(s)
-            except Exception as e:
-                errors.append({"source": "get-stream-captions", "detail": getattr(e, "detail", str(e))})
+            except Exception:
+                pass
 
         try:
             res_id = stream_id or "0"
@@ -661,11 +745,8 @@ class MovieBoxEngine:
             for s in ext:
                 if isinstance(s, dict):
                     _add_sub(s)
-        except Exception as e:
-            errors.append({"source": "get-ext-captions", "detail": getattr(e, "detail", str(e))})
-
-        if not subs and errors:
-            raise HTTPException(status_code=502, detail={"error": "Failed to fetch subtitles", "errors": errors})
+        except Exception:
+            pass
 
         return subs
 
@@ -681,12 +762,13 @@ async def developer_portal():
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>MovieBox Developer API — Docs & Playground</title>
+    <title>APEX API — MovieBox Stream & Sinhala Subtitles</title>
     <style>
         :root {
             --bg: #09090b; --surface: #111114; --surface-2: #18181c; --border: #27272a;
             --text: #fafafa; --dim: #a1a1aa; --blue: #3b82f6; --blue-soft: rgba(59, 130, 246, 0.14);
             --green: #10b981; --green-soft: rgba(16, 185, 129, 0.14);
+            --yellow: #facc15; --yellow-soft: rgba(250, 204, 21, 0.14);
             --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
             --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
         }
@@ -698,26 +780,14 @@ async def developer_portal():
         .title-row h1 { font-size: 20px; font-weight: 700; letter-spacing: -0.4px; }
         .badge { font-family: var(--mono); font-size: 11px; padding: 3px 8px; border-radius: 5px; background: var(--surface-2); border: 1px solid var(--border); color: var(--dim); }
         .badge.live { background: var(--green-soft); border-color: rgba(16,185,129,0.3); color: var(--green); }
+        .badge.si { background: var(--yellow-soft); border-color: rgba(250,204,21,0.3); color: var(--yellow); }
         .nav-btns { display: flex; gap: 8px; }
         .btn { background: var(--surface-2); color: var(--text); border: 1px solid var(--border); padding: 7px 14px; border-radius: 6px; font-size: 12px; font-weight: 600; cursor: pointer; text-decoration: none; display: inline-flex; align-items: center; gap: 6px; transition: 0.15s; }
         .btn:hover { background: #222228; border-color: #3f3f46; }
         .btn.primary { background: var(--text); color: var(--bg); border: none; }
-        .btn.green { background: var(--green-soft); color: var(--green); border-color: rgba(16,185,129,0.3); }
         h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.7px; color: var(--dim); margin-bottom: 10px; }
         .card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 20px; }
         
-        .steps { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px; }
-        .step-box { background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px; padding: 14px; }
-        .step-num { font-family: var(--mono); font-size: 11px; color: var(--blue); font-weight: 700; margin-bottom: 4px; }
-        .step-title { font-weight: 600; font-size: 14px; margin-bottom: 4px; }
-        .step-desc { font-size: 12px; color: var(--dim); }
-        code { font-family: var(--mono); background: #000; padding: 2px 5px; border-radius: 4px; font-size: 12px; color: #e4e4e7; }
-
-        .tabs { display: flex; gap: 6px; margin-bottom: 10px; }
-        .tab { background: transparent; border: 1px solid var(--border); color: var(--dim); padding: 5px 12px; border-radius: 6px; font-size: 12px; cursor: pointer; font-family: var(--mono); }
-        .tab.active { background: var(--blue-soft); border-color: var(--blue); color: var(--blue); font-weight: 600; }
-        pre { background: #070709; border: 1px solid var(--border); border-radius: 8px; padding: 14px; font-family: var(--mono); font-size: 12px; overflow-x: auto; color: #d4d4d8; line-height: 1.5; }
-
         .controls { display: flex; gap: 8px; flex-wrap: wrap; position: relative; }
         .input { background: var(--bg); border: 1px solid var(--border); color: var(--text); padding: 10px 14px; border-radius: 7px; font-size: 13px; outline: none; }
         .input:focus { border-color: var(--blue); }
@@ -728,7 +798,7 @@ async def developer_portal():
         .drop-item:hover { background: #27272a; }
         .stream-item { display: flex; justify-content: space-between; align-items: center; padding: 12px 14px; border-bottom: 1px solid var(--border); gap: 10px; flex-wrap: wrap; }
         .stream-item:last-child { border-bottom: none; }
-
+        code { font-family: var(--mono); background: #000; padding: 2px 5px; border-radius: 4px; font-size: 12px; color: #e4e4e7; }
         table { width: 100%; border-collapse: collapse; }
         th, td { padding: 12px 14px; text-align: left; border-bottom: 1px solid var(--border); font-size: 13px; }
         tr:last-child td { border-bottom: none; }
@@ -740,9 +810,10 @@ async def developer_portal():
 <div class="container">
     <header>
         <div class="title-row">
-            <h1>MovieBox Developer API</h1>
-            <span class="badge">v3.2.0</span>
-            <span class="badge live">● Edge Proxy Enabled</span>
+            <h1>APEX API</h1>
+            <span class="badge">v3.4.0</span>
+            <span class="badge live">● Streams + Sizes</span>
+            <span class="badge si">● EN + Auto-Sinhala SRT</span>
         </div>
         <div class="nav-btns">
             <a href="/health" target="_blank" class="btn">Health Status</a>
@@ -751,46 +822,13 @@ async def developer_portal():
     </header>
 
     <div>
-        <h2>How It Works (3 Simple Steps)</h2>
-        <div class="steps">
-            <div class="step-box">
-                <div class="step-num">STEP 01</div>
-                <div class="step-title">Find Subject ID</div>
-                <div class="step-desc">Search any movie or TV series using <code>/search?q=Avatar</code> to get its <code>subject_id</code>.</div>
-            </div>
-            <div class="step-box">
-                <div class="step-num">STEP 02</div>
-                <div class="step-title">Get Stream Links</div>
-                <div class="step-desc">Call <code>/api/stream/{id}</code> (or <code>?se=1&ep=1</code> for series) to get 1080p, 720p, and 480p links.</div>
-            </div>
-            <div class="step-box">
-                <div class="step-num">STEP 03</div>
-                <div class="step-title">Zero-Header Play & Download</div>
-                <div class="step-desc">Use <code>proxy_url</code> or <code>download_url</code> directly in browsers, HTML5 players, or bots—no headers needed!</div>
-            </div>
-        </div>
-    </div>
-
-    <div>
-        <h2>Quick Copy-Paste Code Examples</h2>
-        <div class="card">
-            <div class="tabs">
-                <button class="tab active" onclick="showCode('js', this)">Node.js / Browser JS</button>
-                <button class="tab" onclick="showCode('py', this)">Python</button>
-                <button class="tab" onclick="showCode('curl', this)">cURL</button>
-            </div>
-            <pre id="codeBlock"></pre>
-        </div>
-    </div>
-
-    <div>
-        <h2>Live API Playground</h2>
+        <h2>Live Stream & Subtitle Playground</h2>
         <div class="card">
             <div class="controls">
                 <input type="text" id="qInput" class="input grow" placeholder="Type movie/series name (e.g. Avatar) or paste Subject ID..." autocomplete="off">
                 <input type="number" id="seInput" class="input small" placeholder="S" title="Season (0 for Movie)" value="0">
                 <input type="number" id="epInput" class="input small" placeholder="E" title="Episode (0 for Movie)" value="0">
-                <button class="btn primary" onclick="runTest()">Fetch Streams</button>
+                <button class="btn primary" onclick="runTest()">Fetch Streams & Subs</button>
                 <div id="dropMenu" class="dropdown"></div>
             </div>
             <div id="resultArea" style="margin-top: 14px;"></div>
@@ -818,6 +856,24 @@ async def developer_portal():
                     </tr>
                     <tr>
                         <td><span class="method">GET</span></td>
+                        <td><code>/api/stream/8906247916759695608</code></td>
+                        <td style="color: var(--dim);">Get qualities, exact file sizes, headers & <code>downloads</code> summary</td>
+                        <td style="text-align: right;"><a href="/api/stream/8906247916759695608" target="_blank" class="btn">Open</a></td>
+                    </tr>
+                    <tr>
+                        <td><span class="method">GET</span></td>
+                        <td><code>/api/stream/8906247916759695608/captions</code></td>
+                        <td style="color: var(--dim);">Returns ONLY <strong>English</strong> & Auto-Translated <strong>Sinhala</strong> SRT</td>
+                        <td style="text-align: right;"><a href="/api/stream/8906247916759695608/captions" target="_blank" class="btn">Open</a></td>
+                    </tr>
+                    <tr>
+                        <td><span class="method">GET</span></td>
+                        <td><code>/api/stream/8906247916759695608/captions/sinhala.srt</code></td>
+                        <td style="color: var(--dim);">Direct downloadable Sinhala <code>.srt</code> with yellow intro credit</td>
+                        <td style="text-align: right;"><a href="/api/stream/8906247916759695608/captions/sinhala.srt" target="_blank" class="btn">Download</a></td>
+                    </tr>
+                    <tr>
+                        <td><span class="method">GET</span></td>
                         <td><code>/detail/8906247916759695608</code></td>
                         <td style="color: var(--dim);">Get synopsis, IMDb rating, cover & audio dubs</td>
                         <td style="text-align: right;"><a href="/detail/8906247916759695608" target="_blank" class="btn">Open</a></td>
@@ -827,18 +883,6 @@ async def developer_portal():
                         <td><code>/episodes/6207982430134357800</code></td>
                         <td style="color: var(--dim);">Get season & episode count for a TV series</td>
                         <td style="text-align: right;"><a href="/episodes/6207982430134357800" target="_blank" class="btn">Open</a></td>
-                    </tr>
-                    <tr>
-                        <td><span class="method">GET</span></td>
-                        <td><code>/api/stream/8906247916759695608</code></td>
-                        <td style="color: var(--dim);">Get MP4 (1080p/720p/480p), <code>proxy_url</code> & <code>download_url</code></td>
-                        <td style="text-align: right;"><a href="/api/stream/8906247916759695608" target="_blank" class="btn">Open</a></td>
-                    </tr>
-                    <tr>
-                        <td><span class="method">GET</span></td>
-                        <td><code>/api/stream/8906247916759695608/captions</code></td>
-                        <td style="color: var(--dim);">Get multi-language subtitle tracks (.srt)</td>
-                        <td style="text-align: right;"><a href="/api/stream/8906247916759695608/captions" target="_blank" class="btn">Open</a></td>
                     </tr>
                     <tr>
                         <td><span class="method">GET</span></td>
@@ -852,12 +896,6 @@ async def developer_portal():
                         <td style="color: var(--dim);">Browse recommended TV series</td>
                         <td style="text-align: right;"><a href="/tv-series?page=1" target="_blank" class="btn">Open</a></td>
                     </tr>
-                    <tr>
-                        <td><span class="method">GET</span></td>
-                        <td><code>/home</code></td>
-                        <td style="color: var(--dim);">Homepage banners & trending feeds</td>
-                        <td style="text-align: right;"><a href="/home" target="_blank" class="btn">Open</a></td>
-                    </tr>
                 </tbody>
             </table>
         </div>
@@ -865,39 +903,6 @@ async def developer_portal():
 </div>
 
 <script>
-    const BASE = window.location.origin;
-    const snippets = {
-        js: `// Fetch streams for Avatar (or add ?se=1&ep=1 for TV series)
-const res = await fetch("${BASE}/api/stream/8906247916759695608");
-const data = await res.json();
-
-// Pick 720p (or 1080p)
-const stream = data.streams.find(s => s.quality === "720p") || data.streams[0];
-
-// Works directly in browser/video player without custom headers!
-console.log("Stream URL:", stream.proxy_url);
-console.log("Direct Download URL:", stream.download_url);`,
-        py: `import requests
-
-data = requests.get("${BASE}/api/stream/8906247916759695608").json()
-stream = data["streams"][0]
-
-# Download directly via proxy_url (no headers required)
-with requests.get(stream["download_url"], stream=True) as r:
-    with open("movie.mp4", "wb") as f:
-        for chunk in r.iter_content(chunk_size=8192):
-            f.write(chunk)`,
-        curl: `# Fetch JSON response
-curl -s "${BASE}/api/stream/8906247916759695608" | jq .`
-    };
-
-    function showCode(lang, btn) {
-        document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-        if (btn) btn.classList.add('active');
-        document.getElementById('codeBlock').textContent = snippets[lang];
-    }
-    showCode('js');
-
     let timer = null;
     let selectedId = "";
     const qInput = document.getElementById("qInput");
@@ -940,35 +945,53 @@ curl -s "${BASE}/api/stream/8906247916759695608" | jq .`
         if (!id) return;
 
         const area = document.getElementById("resultArea");
-        area.innerHTML = '<div style="color: var(--dim);">Resolving streams...</div>';
+        area.innerHTML = '<div style="color: var(--dim);">Fetching streams & subtitles...</div>';
 
         try {
-            const endpoint = `/api/stream/${id}?se=${se}&ep=${ep}`;
-            const res = await fetch(endpoint);
-            const data = await res.json();
-            if (!res.ok) {
-                area.innerHTML = `<pre style="color: #fca5a5;">${JSON.stringify(data, null, 2)}</pre>`;
+            const streamEp = `/api/stream/${id}?se=${se}&ep=${ep}`;
+            const subEp = `/api/stream/${id}/captions?se=${se}&ep=${ep}`;
+            const [sRes, cRes] = await Promise.all([fetch(streamEp), fetch(subEp)]);
+            const sData = await sRes.json();
+            const cData = await cRes.json();
+
+            if (!sRes.ok) {
+                area.innerHTML = `<pre style="color: #fca5a5;">${JSON.stringify(sData, null, 2)}</pre>`;
                 return;
             }
-            const streams = data.streams || [];
+            const streams = sData.streams || [];
+            const subs = cData.captions || [];
+
             area.innerHTML = `
-                <div style="margin-bottom: 10px; display: flex; justify-content: space-between; align-items: center;">
-                    <span style="font-family: var(--mono); font-size: 12px; color: var(--green);">GET ${endpoint} (${streams.length} streams)</span>
-                    <a href="${endpoint}" target="_blank" class="btn">View Full JSON ↗</a>
+                <div style="margin-bottom: 10px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px;">
+                    <span style="font-family: var(--mono); font-size: 12px; color: var(--green);">Streams (${streams.length}) & Subtitles (${subs.length})</span>
+                    <div style="display: flex; gap: 6px;">
+                        <a href="${streamEp}" target="_blank" class="btn">Stream JSON ↗</a>
+                        <a href="${subEp}" target="_blank" class="btn">Subtitles JSON ↗</a>
+                    </div>
                 </div>
-                <div style="border: 1px solid var(--border); border-radius: 8px; background: var(--bg);">
+                <div style="border: 1px solid var(--border); border-radius: 8px; background: var(--bg); margin-bottom: 12px;">
                     ${streams.map(s => `
                         <div class="stream-item">
                             <div style="display: flex; align-items: center; gap: 10px;">
                                 <span class="badge live">${s.quality}</span>
                                 <strong>${s.format}</strong>
-                                <span style="color: var(--dim); font-size: 12px;">${s.size_mb ? s.size_mb + ' MB' : 'Adaptive'}</span>
+                                <span style="color: var(--dim); font-size: 12px;">${s.size}</span>
                             </div>
                             <div style="display: flex; gap: 6px;">
-                                <a href="${s.proxy_url}" target="_blank" class="btn">Play in Browser</a>
-                                ${s.download_url ? `<a href="${s.download_url}" class="btn green">Download</a>` : ''}
-                                <button class="btn" onclick="navigator.clipboard.writeText('${s.proxy_url}'); alert('Proxy Stream URL Copied!')">Copy Link</button>
+                                <button class="btn" onclick="navigator.clipboard.writeText('${s.dl_link}'); alert('DL Link Copied!')">Copy DL Link</button>
+                                <button class="btn" onclick='navigator.clipboard.writeText(${JSON.stringify(JSON.stringify(s.headers))}); alert("Headers JSON Copied!")'>Copy Headers</button>
                             </div>
+                        </div>
+                    `).join("")}
+                </div>
+                <div style="border: 1px solid var(--border); border-radius: 8px; background: var(--bg);">
+                    ${subs.map(sub => `
+                        <div class="stream-item">
+                            <div style="display: flex; align-items: center; gap: 10px;">
+                                <span class="badge ${sub.code === 'si' ? 'si' : 'live'}">${sub.language} (${sub.code})</span>
+                                <span style="color: var(--dim); font-size: 12px;">${sub.auto_translated ? 'Auto-Translated + Yellow Intro' : 'Original SRT'}</span>
+                            </div>
+                            <a href="${sub.url}" target="_blank" class="btn">Download .SRT</a>
                         </div>
                     `).join("")}
                 </div>
@@ -985,13 +1008,13 @@ curl -s "${BASE}/api/stream/8906247916759695608" | jq .`
 # ==========================================
 # PUBLIC REST ENDPOINTS
 # ==========================================
-@app.get("/health", tags=["System"], summary="Check API Server Health & Proxy Config")
+@app.get("/health", tags=["System"], summary="Check APEX API Health")
 def health_check():
     return {
         "status": "ok",
-        "version": "3.2.0",
+        "api": "APEX API",
+        "version": "3.4.0",
         "tls_client": "curl_cffi (chrome120)" if cr is not None else "httpx (fallback)",
-        "edge_proxy": WORKER_PROXY_URL,
         "cached_entries": len(RESPONSE_CACHE),
         "rate_limit_per_min": MAX_REQ_PER_MIN
     }
@@ -1066,7 +1089,7 @@ def get_episodes(subject_id: str = Path(...)):
     set_cache(cache_key, res, ttl_sec=900)
     return res
 
-@app.get("/api/stream/{subject_id}", tags=["Streams & Subtitles"], summary="Resolve MP4 & DASH Stream Links (With Proxy URLs)")
+@app.get("/api/stream/{subject_id}", tags=["Streams & Subtitles"], summary="Get Streams, Qualities, File Sizes & DL Links")
 def get_streams(
     subject_id: str = Path(...),
     se: int = Query(0, ge=0),
@@ -1077,40 +1100,123 @@ def get_streams(
     cached = get_cache(cache_key)
     if cached:
         return cached
+
     result = engine.get_streams(subject_id, season=se, episode=ep, detail_path=detail_path)
     streams = result["streams"]
+
+    # Clean summary list at the end with quality, size, and dl_link
+    downloads = [
+        {
+            "quality": s["quality"],
+            "format": s["format"],
+            "size": s["size"],
+            "dl_link": s["dl_link"],
+            "headers": s["headers"],
+        }
+        for s in streams
+    ]
+
     res = {
         "subject_id": subject_id,
+        "title": result.get("title"),
         "season": se,
         "episode": ep,
         "count": len(streams),
-        "streams": streams
+        "streams": streams,
+        "downloads": downloads
     }
     set_cache(cache_key, res, ttl_sec=300)
     return res
 
-@app.get("/api/stream/{subject_id}/captions", tags=["Streams & Subtitles"], summary="Get Multi-Language Subtitles (.srt)")
+@app.get("/api/stream/{subject_id}/captions", tags=["Streams & Subtitles"], summary="Get English & Auto-Translated Sinhala Subtitles")
 def get_captions(
+    request: Request,
     subject_id: str = Path(...),
     se: int = Query(0, ge=0),
     ep: int = Query(0, ge=0),
     stream_id: Optional[str] = Query(None)
 ):
-    cache_key = f"captions:{subject_id}:{se}:{ep}"
-    cached = get_cache(cache_key)
-    if cached:
-        return cached
-    subs = engine.get_subtitles(subject_id, stream_id=stream_id, season=se, episode=ep)
-    res = {
+    raw_subs = engine.get_raw_subtitles(subject_id, stream_id=stream_id, season=se, episode=ep)
+
+    # Pick English subtitle only
+    en_sub = None
+    for s in raw_subs:
+        lang_lower = (s.get("language") or "").lower()
+        code_lower = (s.get("code") or "").lower()
+        if code_lower.startswith("en") or "english" in lang_lower:
+            en_sub = s
+            break
+
+    if not en_sub and raw_subs:
+        en_sub = raw_subs[0]
+
+    filtered_captions = []
+    base_url = str(request.base_url).rstrip("/")
+
+    if en_sub:
+        filtered_captions.append({
+            "language": "English",
+            "code": "en",
+            "auto_translated": False,
+            "url": en_sub["url"],
+            "size": en_sub.get("size"),
+        })
+
+        # Add Auto-Translated Sinhala SRT endpoint
+        si_srt_url = f"{base_url}/api/stream/{subject_id}/captions/sinhala.srt?se={se}&ep={ep}"
+        filtered_captions.append({
+            "language": "Sinhala",
+            "code": "si",
+            "auto_translated": True,
+            "watermark": "APEX API TRANSLATE - POWERED BY MALIYA-MD (00:00:01 - 00:00:03, Yellow)",
+            "url": si_srt_url,
+            "size": None,
+        })
+
+    return {
         "subject_id": subject_id,
         "season": se,
         "episode": ep,
-        "count": len(subs),
-        "captions": subs
+        "count": len(filtered_captions),
+        "captions": filtered_captions
     }
-    if subs:
-        set_cache(cache_key, res, ttl_sec=600)
-    return res
+
+@app.get("/api/stream/{subject_id}/captions/sinhala.srt", tags=["Streams & Subtitles"], summary="Download Translated Sinhala .SRT File")
+async def get_sinhala_srt_file(
+    subject_id: str = Path(...),
+    se: int = Query(0, ge=0),
+    ep: int = Query(0, ge=0),
+    stream_id: Optional[str] = Query(None)
+):
+    cache_key = f"si_srt:{subject_id}:{se}:{ep}"
+    cached_srt = get_cache(cache_key)
+    if cached_srt:
+        return Response(
+            content=cached_srt.encode("utf-8"),
+            media_type="application/x-subrip; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="{subject_id}_S{se:02d}E{ep:02d}_si.srt"'}
+        )
+
+    raw_subs = engine.get_raw_subtitles(subject_id, stream_id=stream_id, season=se, episode=ep)
+    en_sub = None
+    for s in raw_subs:
+        if (s.get("code") or "").lower().startswith("en") or "english" in (s.get("language") or "").lower():
+            en_sub = s
+            break
+    if not en_sub and raw_subs:
+        en_sub = raw_subs[0]
+
+    if not en_sub:
+        raise HTTPException(status_code=404, detail="No English subtitle track available to translate into Sinhala.")
+
+    sinhala_srt_content = await translate_srt_to_sinhala(en_sub["url"])
+    set_cache(cache_key, sinhala_srt_content, ttl_sec=3600)
+
+    return Response(
+        content=sinhala_srt_content.encode("utf-8"),
+        media_type="application/x-subrip; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{subject_id}_S{se:02d}E{ep:02d}_si.srt"'}
+    )
 
 @app.get("/movies", tags=["Search & Discovery"], summary="Browse Recommended Movies")
 def get_movies(
