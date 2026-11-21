@@ -11,7 +11,7 @@ import sys
 import time
 import traceback
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import quote, urlsplit
+from urllib.parse import urlsplit
 
 import httpx
 from fastapi import FastAPI, HTTPException, Path, Query, Request
@@ -35,16 +35,17 @@ if sys.stderr and hasattr(sys.stderr, "reconfigure"):
         pass
 
 API_DESCRIPTION = """
-### APEX API — MovieBox Metadata, Streams & Auto-Translated Sinhala Subtitles
+### APEX API — Movies & Batch TV Series Stream + Sinhala Subtitle Engine
 
-- **Streams:** Returns available qualities (`1080p`, `720p`, `480p`), exact file sizes, and direct CDN download links (`dl_link`) with required headers.
-- **Subtitles:** Automatically filters **English** and **Sinhala** tracks only. If Sinhala is unavailable upstream, auto-translates the English `.srt` into Sinhala with a yellow intro watermark (`00:00:01 --> 00:00:03`).
+- **Movies:** `GET /api/stream/{subject_id}`
+- **TV Series Step 1:** `GET /epi/{subject_id}` (Get seasons & episode counts)
+- **TV Series Step 2:** `GET /dl/{subject_id}?se=1` (Get all episodes in Season 1 with qualities, sizes & EN/SI subtitles)
 """
 
 app = FastAPI(
     title="APEX API — MovieBox Stream & Subtitle Engine",
     description=API_DESCRIPTION,
-    version="3.4.0",
+    version="3.6.0",
     docs_url="/docs",
     redoc_url="/redoc",
 )
@@ -73,7 +74,7 @@ async def global_exception_handler(request: Request, exc: Exception):
     )
 
 # ==========================================
-# SECURITY: RATE LIMITER & IN-MEMORY CACHE
+# SECURITY: RATE LIMITER & 10-MIN TTL CACHE
 # ==========================================
 RATE_LIMIT_STORE: Dict[str, List[float]] = defaultdict(list)
 MAX_REQ_PER_MIN = int(os.environ.get("RATE_LIMIT", 40))
@@ -97,7 +98,7 @@ def set_cache(key: str, value: Any, ttl_sec: int = 600) -> None:
 
 @app.middleware("http")
 async def rate_limit_middleware(request: Request, call_next):
-    protected_prefixes = ("/api/", "/search", "/detail", "/episodes", "/movies", "/tv-series", "/home")
+    protected_prefixes = ("/api/", "/epi/", "/dl/", "/search", "/detail", "/movies", "/tv-series", "/home")
     if request.url.path.startswith(protected_prefixes):
         forwarded = request.headers.get("x-forwarded-for")
         client_ip = forwarded.split(",")[0].strip() if forwarded else (request.client.host if request.client else "unknown")
@@ -299,7 +300,7 @@ async def _translate_chunk(client: httpx.AsyncClient, lines: List[str]) -> List[
         pass
     return lines
 
-async def translate_srt_to_sinhala(en_srt_url: str) -> str:
+async def build_subtitles_from_english(en_srt_url: str) -> Tuple[str, str]:
     async with httpx.AsyncClient(timeout=25, follow_redirects=True) as client:
         resp = await client.get(en_srt_url, headers={"User-Agent": "Mozilla/5.0"})
         if resp.status_code != 200:
@@ -326,7 +327,6 @@ async def translate_srt_to_sinhala(en_srt_url: str) -> str:
             parsed_blocks.append((str(len(parsed_blocks) + 1), time_line, clean_body))
             texts_to_translate.append(clean_body)
 
-    # Batch translate in chunks of 35 lines concurrently
     chunk_size = 35
     chunks = [texts_to_translate[i:i + chunk_size] for i in range(0, len(texts_to_translate), chunk_size)]
     translated_texts: List[str] = []
@@ -341,7 +341,6 @@ async def translate_srt_to_sinhala(en_srt_url: str) -> str:
         for res_list in results:
             translated_texts.extend(res_list)
 
-    # Build final Sinhala SRT with Yellow Watermark at 00:00:01,000 --> 00:00:03,000
     watermark_block = (
         "1\n"
         "00:00:01,000 --> 00:00:03,000\n"
@@ -353,15 +352,14 @@ async def translate_srt_to_sinhala(en_srt_url: str) -> str:
         si_text = translated_texts[i] if i < len(translated_texts) else ""
         if not si_text:
             continue
-        # Shift subtitle index by +1 so watermark is #1
-        # Avoid overlapping at 00:00:01 - 00:00:03 if first cue starts at 00:00:00
         if i == 0 and time_line.startswith("00:00:00"):
             parts = time_line.split("-->")
             if len(parts) == 2:
                 time_line = f"00:00:03,100 --> {parts[1].strip()}"
         out_blocks.append(f"{i + 2}\n{time_line}\n{si_text}")
 
-    return "\n\n".join(out_blocks) + "\n"
+    sinhala_srt = "\n\n".join(out_blocks) + "\n"
+    return raw_srt, sinhala_srt
 
 # ==========================================
 # CORE MOVIEBOX ENGINE
@@ -579,10 +577,10 @@ class MovieBoxEngine:
             for s in seasons
         ]
 
-    def get_streams(self, subject_id: str, season: int = 0, episode: int = 0, detail_path: Optional[str] = None) -> Dict[str, Any]:
+    def get_streams(self, subject_id: str, season: int = 0, episode: int = 0, detail_path: Optional[str] = None, raise_if_empty: bool = True) -> Dict[str, Any]:
         domain_logs = []
         title = None
-        if not detail_path:
+        if detail_path is None:
             try:
                 details = self.get_details(subject_id)
                 detail_path = details.get("detail_path", "")
@@ -686,7 +684,7 @@ class MovieBoxEngine:
                 domain_logs.append({"domain": domain, "exception": str(e)})
                 continue
 
-        if not streams:
+        if not streams and raise_if_empty:
             raise HTTPException(
                 status_code=502,
                 detail={
@@ -701,29 +699,27 @@ class MovieBoxEngine:
         streams.sort(key=lambda s: s["quality_value"], reverse=True)
         return {"title": title, "streams": streams}
 
-    def get_raw_subtitles(self, subject_id: str, stream_id: Optional[str] = None, season: int = 0, episode: int = 0) -> List[Dict[str, Any]]:
+    def get_english_subtitle_url(self, subject_id: str, season: int = 0, episode: int = 0) -> Optional[str]:
         subs: List[Dict[str, Any]] = []
         seen_urls = set()
+        stream_id = None
 
-        if not stream_id:
-            try:
-                native_url = f"/wefeed-mobile-bff/subject-api/play-info?subjectId={subject_id}&se={season}&ep={episode}"
-                raw_streams = self.api_request("GET", native_url).get("data", {}).get("streams", [])
-                if raw_streams and raw_streams[0].get("id"):
-                    stream_id = str(raw_streams[0]["id"])
-            except Exception:
-                pass
+        try:
+            native_url = f"/wefeed-mobile-bff/subject-api/play-info?subjectId={subject_id}&se={season}&ep={episode}"
+            raw_streams = self.api_request("GET", native_url).get("data", {}).get("streams", [])
+            if raw_streams and raw_streams[0].get("id"):
+                stream_id = str(raw_streams[0]["id"])
+        except Exception:
+            pass
 
         def _add_sub(item: Dict[str, Any]):
             u = item.get("url")
             if u and u not in seen_urls:
                 seen_urls.add(u)
                 subs.append({
-                    "id": str(item.get("id", "")),
-                    "language": item.get("lanName") or item.get("language") or "English",
+                    "language": (item.get("lanName") or item.get("language") or "").lower(),
                     "code": (item.get("lan") or "").lower(),
                     "url": u,
-                    "size": item.get("size")
                 })
 
         if stream_id:
@@ -748,7 +744,10 @@ class MovieBoxEngine:
         except Exception:
             pass
 
-        return subs
+        for s in subs:
+            if s["code"].startswith("en") or "english" in s["language"]:
+                return s["url"]
+        return subs[0]["url"] if subs else None
 
 engine = MovieBoxEngine.get_instance()
 
@@ -762,11 +761,11 @@ async def developer_portal():
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>APEX API — MovieBox Stream & Sinhala Subtitles</title>
+    <title>APEX API — MovieBox Movies & TV Series Engine</title>
     <style>
         :root {
             --bg: #09090b; --surface: #111114; --surface-2: #18181c; --border: #27272a;
-            --text: #fafafa; --dim: #a1a1aa; --blue: #3b82f6; --blue-soft: rgba(59, 130, 246, 0.14);
+            --text: #fafafa; --dim: #a1a1aa; --blue: #3b82f6;
             --green: #10b981; --green-soft: rgba(16, 185, 129, 0.14);
             --yellow: #facc15; --yellow-soft: rgba(250, 204, 21, 0.14);
             --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
@@ -787,17 +786,6 @@ async def developer_portal():
         .btn.primary { background: var(--text); color: var(--bg); border: none; }
         h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.7px; color: var(--dim); margin-bottom: 10px; }
         .card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 20px; }
-        
-        .controls { display: flex; gap: 8px; flex-wrap: wrap; position: relative; }
-        .input { background: var(--bg); border: 1px solid var(--border); color: var(--text); padding: 10px 14px; border-radius: 7px; font-size: 13px; outline: none; }
-        .input:focus { border-color: var(--blue); }
-        .input.grow { flex: 1; min-width: 220px; }
-        .input.small { width: 75px; }
-        .dropdown { position: absolute; top: 44px; left: 0; right: 0; background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px; max-height: 220px; overflow-y: auto; z-index: 30; display: none; }
-        .drop-item { padding: 10px 14px; cursor: pointer; display: flex; justify-content: space-between; border-bottom: 1px solid var(--border); font-size: 13px; }
-        .drop-item:hover { background: #27272a; }
-        .stream-item { display: flex; justify-content: space-between; align-items: center; padding: 12px 14px; border-bottom: 1px solid var(--border); gap: 10px; flex-wrap: wrap; }
-        .stream-item:last-child { border-bottom: none; }
         code { font-family: var(--mono); background: #000; padding: 2px 5px; border-radius: 4px; font-size: 12px; color: #e4e4e7; }
         table { width: 100%; border-collapse: collapse; }
         th, td { padding: 12px 14px; text-align: left; border-bottom: 1px solid var(--border); font-size: 13px; }
@@ -811,9 +799,9 @@ async def developer_portal():
     <header>
         <div class="title-row">
             <h1>APEX API</h1>
-            <span class="badge">v3.4.0</span>
-            <span class="badge live">● Streams + Sizes</span>
-            <span class="badge si">● EN + Auto-Sinhala SRT</span>
+            <span class="badge">v3.6.0</span>
+            <span class="badge live">● Movies + Batch TV Series</span>
+            <span class="badge si">● EN + Sinhala SRT (10m Cache)</span>
         </div>
         <div class="nav-btns">
             <a href="/health" target="_blank" class="btn">Health Status</a>
@@ -822,21 +810,7 @@ async def developer_portal():
     </header>
 
     <div>
-        <h2>Live Stream & Subtitle Playground</h2>
-        <div class="card">
-            <div class="controls">
-                <input type="text" id="qInput" class="input grow" placeholder="Type movie/series name (e.g. Avatar) or paste Subject ID..." autocomplete="off">
-                <input type="number" id="seInput" class="input small" placeholder="S" title="Season (0 for Movie)" value="0">
-                <input type="number" id="epInput" class="input small" placeholder="E" title="Episode (0 for Movie)" value="0">
-                <button class="btn primary" onclick="runTest()">Fetch Streams & Subs</button>
-                <div id="dropMenu" class="dropdown"></div>
-            </div>
-            <div id="resultArea" style="margin-top: 14px;"></div>
-        </div>
-    </div>
-
-    <div>
-        <h2>Available REST Endpoints</h2>
+        <h2>Endpoints Overview</h2>
         <div class="card" style="padding: 0; overflow-x: auto;">
             <table>
                 <thead>
@@ -850,39 +824,33 @@ async def developer_portal():
                 <tbody>
                     <tr>
                         <td><span class="method">GET</span></td>
-                        <td><code>/search?q=Avatar</code></td>
-                        <td style="color: var(--dim);">Search movies & TV shows by keyword</td>
-                        <td style="text-align: right;"><a href="/search?q=Avatar" target="_blank" class="btn">Open</a></td>
+                        <td><code>/search?q=Breaking+Bad</code></td>
+                        <td style="color: var(--dim);">Search Movies & TV Series to get <code>subject_id</code></td>
+                        <td style="text-align: right;"><a href="/search?q=Breaking+Bad" target="_blank" class="btn">Open</a></td>
                     </tr>
                     <tr>
                         <td><span class="method">GET</span></td>
                         <td><code>/api/stream/8906247916759695608</code></td>
-                        <td style="color: var(--dim);">Get qualities, exact file sizes, headers & <code>downloads</code> summary</td>
+                        <td style="color: var(--dim);"><strong>[Movie]</strong> DL links + qualities + sizes + EN & Sinhala SRT links</td>
                         <td style="text-align: right;"><a href="/api/stream/8906247916759695608" target="_blank" class="btn">Open</a></td>
                     </tr>
                     <tr>
                         <td><span class="method">GET</span></td>
-                        <td><code>/api/stream/8906247916759695608/captions</code></td>
-                        <td style="color: var(--dim);">Returns ONLY <strong>English</strong> & Auto-Translated <strong>Sinhala</strong> SRT</td>
-                        <td style="text-align: right;"><a href="/api/stream/8906247916759695608/captions" target="_blank" class="btn">Open</a></td>
+                        <td><code>/epi/6207982430134357800</code></td>
+                        <td style="color: var(--dim);"><strong>[TV Series Step 1]</strong> Get Seasons & Episode counts</td>
+                        <td style="text-align: right;"><a href="/epi/6207982430134357800" target="_blank" class="btn">Open</a></td>
                     </tr>
                     <tr>
                         <td><span class="method">GET</span></td>
-                        <td><code>/api/stream/8906247916759695608/captions/sinhala.srt</code></td>
-                        <td style="color: var(--dim);">Direct downloadable Sinhala <code>.srt</code> with yellow intro credit</td>
-                        <td style="text-align: right;"><a href="/api/stream/8906247916759695608/captions/sinhala.srt" target="_blank" class="btn">Download</a></td>
+                        <td><code>/dl/6207982430134357800?se=1</code></td>
+                        <td style="color: var(--dim);"><strong>[TV Series Step 2]</strong> Batch all episodes in Season 1 (DL links + EN/SI SRT)</td>
+                        <td style="text-align: right;"><a href="/dl/6207982430134357800?se=1" target="_blank" class="btn">Open</a></td>
                     </tr>
                     <tr>
                         <td><span class="method">GET</span></td>
                         <td><code>/detail/8906247916759695608</code></td>
-                        <td style="color: var(--dim);">Get synopsis, IMDb rating, cover & audio dubs</td>
+                        <td style="color: var(--dim);">Full metadata, synopsis, rating & dubs</td>
                         <td style="text-align: right;"><a href="/detail/8906247916759695608" target="_blank" class="btn">Open</a></td>
-                    </tr>
-                    <tr>
-                        <td><span class="method">GET</span></td>
-                        <td><code>/episodes/6207982430134357800</code></td>
-                        <td style="color: var(--dim);">Get season & episode count for a TV series</td>
-                        <td style="text-align: right;"><a href="/episodes/6207982430134357800" target="_blank" class="btn">Open</a></td>
                     </tr>
                     <tr>
                         <td><span class="method">GET</span></td>
@@ -901,106 +869,6 @@ async def developer_portal():
         </div>
     </div>
 </div>
-
-<script>
-    let timer = null;
-    let selectedId = "";
-    const qInput = document.getElementById("qInput");
-    const dropMenu = document.getElementById("dropMenu");
-
-    qInput.addEventListener("input", (e) => {
-        clearTimeout(timer);
-        const val = e.target.value.trim();
-        if (val.length < 2) { dropMenu.style.display = "none"; return; }
-        if (/^\\d{15,}$/.test(val)) { selectedId = val; dropMenu.style.display = "none"; return; }
-        timer = setTimeout(async () => {
-            try {
-                const res = await fetch(`/search/suggest?q=${encodeURIComponent(val)}`);
-                const data = await res.json();
-                const items = data.suggestions || [];
-                if (!items.length) { dropMenu.style.display = "none"; return; }
-                dropMenu.innerHTML = items.map(i => `
-                    <div class="drop-item" onclick="pick('${i.subject_id}', '${i.title.replace(/'/g, "\\\\'")}')">
-                        <span>${i.title}</span>
-                        <span style="font-family: var(--mono); color: var(--dim); font-size: 11px;">${i.subject_id}</span>
-                    </div>
-                `).join("");
-                dropMenu.style.display = "block";
-            } catch (e) {}
-        }, 250);
-    });
-
-    function pick(id, title) {
-        selectedId = id;
-        qInput.value = title;
-        dropMenu.style.display = "none";
-        runTest();
-    }
-
-    async function runTest() {
-        const val = qInput.value.trim();
-        const id = /^\\d{15,}$/.test(val) ? val : (selectedId || val);
-        const se = parseInt(document.getElementById("seInput").value) || 0;
-        const ep = parseInt(document.getElementById("epInput").value) || 0;
-        if (!id) return;
-
-        const area = document.getElementById("resultArea");
-        area.innerHTML = '<div style="color: var(--dim);">Fetching streams & subtitles...</div>';
-
-        try {
-            const streamEp = `/api/stream/${id}?se=${se}&ep=${ep}`;
-            const subEp = `/api/stream/${id}/captions?se=${se}&ep=${ep}`;
-            const [sRes, cRes] = await Promise.all([fetch(streamEp), fetch(subEp)]);
-            const sData = await sRes.json();
-            const cData = await cRes.json();
-
-            if (!sRes.ok) {
-                area.innerHTML = `<pre style="color: #fca5a5;">${JSON.stringify(sData, null, 2)}</pre>`;
-                return;
-            }
-            const streams = sData.streams || [];
-            const subs = cData.captions || [];
-
-            area.innerHTML = `
-                <div style="margin-bottom: 10px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px;">
-                    <span style="font-family: var(--mono); font-size: 12px; color: var(--green);">Streams (${streams.length}) & Subtitles (${subs.length})</span>
-                    <div style="display: flex; gap: 6px;">
-                        <a href="${streamEp}" target="_blank" class="btn">Stream JSON ↗</a>
-                        <a href="${subEp}" target="_blank" class="btn">Subtitles JSON ↗</a>
-                    </div>
-                </div>
-                <div style="border: 1px solid var(--border); border-radius: 8px; background: var(--bg); margin-bottom: 12px;">
-                    ${streams.map(s => `
-                        <div class="stream-item">
-                            <div style="display: flex; align-items: center; gap: 10px;">
-                                <span class="badge live">${s.quality}</span>
-                                <strong>${s.format}</strong>
-                                <span style="color: var(--dim); font-size: 12px;">${s.size}</span>
-                            </div>
-                            <div style="display: flex; gap: 6px;">
-                                <button class="btn" onclick="navigator.clipboard.writeText('${s.dl_link}'); alert('DL Link Copied!')">Copy DL Link</button>
-                                <button class="btn" onclick='navigator.clipboard.writeText(${JSON.stringify(JSON.stringify(s.headers))}); alert("Headers JSON Copied!")'>Copy Headers</button>
-                            </div>
-                        </div>
-                    `).join("")}
-                </div>
-                <div style="border: 1px solid var(--border); border-radius: 8px; background: var(--bg);">
-                    ${subs.map(sub => `
-                        <div class="stream-item">
-                            <div style="display: flex; align-items: center; gap: 10px;">
-                                <span class="badge ${sub.code === 'si' ? 'si' : 'live'}">${sub.language} (${sub.code})</span>
-                                <span style="color: var(--dim); font-size: 12px;">${sub.auto_translated ? 'Auto-Translated + Yellow Intro' : 'Original SRT'}</span>
-                            </div>
-                            <a href="${sub.url}" target="_blank" class="btn">Download .SRT</a>
-                        </div>
-                    `).join("")}
-                </div>
-            `;
-        } catch (err) {
-            area.innerHTML = `<div style="color: #ef4444;">Request failed: ${err.message}</div>`;
-        }
-    }
-</script>
 </body>
 </html>"""
     return HTMLResponse(content=html_content)
@@ -1013,7 +881,7 @@ def health_check():
     return {
         "status": "ok",
         "api": "APEX API",
-        "version": "3.4.0",
+        "version": "3.6.0",
         "tls_client": "curl_cffi (chrome120)" if cr is not None else "httpx (fallback)",
         "cached_entries": len(RESPONSE_CACHE),
         "rate_limit_per_min": MAX_REQ_PER_MIN
@@ -1069,7 +937,7 @@ def search_suggest(q: str = Query(..., min_length=1)):
     set_cache(cache_key, res, ttl_sec=600)
     return res
 
-@app.get("/detail/{subject_id}", tags=["Metadata & Episodes"], summary="Get Full Metadata & Audio Dubs")
+@app.get("/detail/{subject_id}", tags=["Metadata"], summary="Get Full Metadata & Audio Dubs")
 def get_detail(subject_id: str = Path(...)):
     cache_key = f"detail:{subject_id}"
     cached = get_cache(cache_key)
@@ -1079,24 +947,135 @@ def get_detail(subject_id: str = Path(...)):
     set_cache(cache_key, res, ttl_sec=900)
     return res
 
-@app.get("/episodes/{subject_id}", tags=["Metadata & Episodes"], summary="Get TV Series Seasons & Episodes")
-def get_episodes(subject_id: str = Path(...)):
-    cache_key = f"episodes:{subject_id}"
+# ==========================================
+# TV SERIES STEP 1: /epi/{subject_id}
+# ==========================================
+@app.get("/epi/{subject_id}", tags=["TV Series"], summary="Get Seasons & Episode Counts Only")
+def get_series_seasons(request: Request, subject_id: str = Path(...)):
+    cache_key = f"epi:{subject_id}"
     cached = get_cache(cache_key)
     if cached:
         return cached
-    res = {"subject_id": subject_id, "seasons": engine.get_episodes(subject_id)}
+
+    details = engine.get_details(subject_id)
+    seasons_raw = engine.get_episodes(subject_id)
+    base_url = str(request.base_url).rstrip("/")
+
+    seasons_list = [
+        {
+            "season": s["season"],
+            "episodes_count": s["episode_count"],
+            "dl_endpoint": f"{base_url}/dl/{subject_id}?se={s['season']}"
+        }
+        for s in seasons_raw
+    ]
+
+    res = {
+        "subject_id": subject_id,
+        "title": details.get("title"),
+        "total_seasons": len(seasons_list),
+        "seasons": seasons_list
+    }
     set_cache(cache_key, res, ttl_sec=900)
     return res
 
-@app.get("/api/stream/{subject_id}", tags=["Streams & Subtitles"], summary="Get Streams, Qualities, File Sizes & DL Links")
-def get_streams(
+# ==========================================
+# TV SERIES STEP 2: /dl/{subject_id}?se=1
+# ==========================================
+@app.get("/dl/{subject_id}", tags=["TV Series"], summary="Batch Get All Episodes DL Links & Subtitles for a Season")
+async def get_season_batch_downloads(
+    request: Request,
+    subject_id: str = Path(...),
+    se: int = Query(1, ge=1, description="Season number (e.g. 1)")
+):
+    cache_key = f"dl_season:{subject_id}:se{se}"
+    cached = get_cache(cache_key)
+    if cached:
+        return cached
+
+    details = engine.get_details(subject_id)
+    detail_path = details.get("detail_path", "")
+    series_title = details.get("title")
+
+    seasons_raw = engine.get_episodes(subject_id)
+    target_season = next((s for s in seasons_raw if s["season"] == se), None)
+    if not target_season:
+        raise HTTPException(status_code=404, detail={"error": f"Season {se} not found", "available_seasons": [s["season"] for s in seasons_raw]})
+
+    total_eps = target_season["episode_count"]
+    base_url = str(request.base_url).rstrip("/")
+    sem = asyncio.Semaphore(4)
+
+    async def fetch_single_episode(ep_num: int) -> Dict[str, Any]:
+        async with sem:
+            stream_res = await asyncio.to_thread(
+                engine.get_streams,
+                subject_id,
+                se,
+                ep_num,
+                detail_path,
+                False
+            )
+            streams = stream_res.get("streams", [])
+
+            ep_entry: Dict[str, Any] = {
+                "episode": f"{ep_num:02d}",
+            }
+
+            # Add clean "<quality> download" keys sorted from lowest to highest (e.g. 360p, 480p, 720p, 1080p)
+            mp4_streams = [s for s in streams if s["format"] == "MP4"]
+            mp4_streams.sort(key=lambda x: x["quality_value"])
+
+            for s in mp4_streams:
+                ep_entry[f"{s['quality']} download"] = {
+                    "size": s["size"],
+                    "link": s["dl_link"],
+                    "headers": s["headers"]
+                }
+
+            # Fallback if only DASH streams exist
+            if not mp4_streams:
+                for s in streams:
+                    ep_entry[f"{s['quality']} download"] = {
+                        "size": s["size"],
+                        "link": s["dl_link"],
+                        "headers": s["headers"]
+                    }
+
+            # Check English subtitle availability and attach direct cached download links
+            en_url = await asyncio.to_thread(engine.get_english_subtitle_url, subject_id, se, ep_num)
+            if en_url:
+                ep_entry["sinhala subtitle"] = f"{base_url}/sub/{subject_id}/si.srt?se={se}&ep={ep_num}"
+                ep_entry["english subtitle"] = f"{base_url}/sub/{subject_id}/en.srt?se={se}&ep={ep_num}"
+            else:
+                ep_entry["sinhala subtitle"] = None
+                ep_entry["english subtitle"] = None
+
+            return ep_entry
+
+    episodes_data = await asyncio.gather(*(fetch_single_episode(ep) for ep in range(1, total_eps + 1)))
+
+    res = {
+        "series": series_title,
+        "season": se,
+        "total_episodes": total_eps,
+        "episodes": episodes_data
+    }
+    set_cache(cache_key, res, ttl_sec=600)
+    return res
+
+# ==========================================
+# MOVIES (OR SINGLE EPISODE): /api/stream/{subject_id}
+# ==========================================
+@app.get("/api/stream/{subject_id}", tags=["Movies & Single Stream"], summary="Get Streams, Sizes, DL Links & Direct EN/SI Subtitles")
+async def get_streams(
+    request: Request,
     subject_id: str = Path(...),
     se: int = Query(0, ge=0),
     ep: int = Query(0, ge=0),
     detail_path: Optional[str] = Query(None)
 ):
-    cache_key = f"stream:{subject_id}:{se}:{ep}"
+    cache_key = f"stream_full:{subject_id}:{se}:{ep}"
     cached = get_cache(cache_key)
     if cached:
         return cached
@@ -1104,7 +1083,6 @@ def get_streams(
     result = engine.get_streams(subject_id, season=se, episode=ep, detail_path=detail_path)
     streams = result["streams"]
 
-    # Clean summary list at the end with quality, size, and dl_link
     downloads = [
         {
             "quality": s["quality"],
@@ -1116,6 +1094,22 @@ def get_streams(
         for s in streams
     ]
 
+    subtitles_obj = None
+    en_url = engine.get_english_subtitle_url(subject_id, season=se, episode=ep)
+    if en_url:
+        try:
+            en_srt, si_srt = await build_subtitles_from_english(en_url)
+            set_cache(f"srt_file:en:{subject_id}:{se}:{ep}", en_srt, ttl_sec=600)
+            set_cache(f"srt_file:si:{subject_id}:{se}:{ep}", si_srt, ttl_sec=600)
+
+            base_url = str(request.base_url).rstrip("/")
+            subtitles_obj = {
+                "english": f"{base_url}/sub/{subject_id}/en.srt?se={se}&ep={ep}",
+                "sinhala": f"{base_url}/sub/{subject_id}/si.srt?se={se}&ep={ep}",
+            }
+        except Exception:
+            subtitles_obj = None
+
     res = {
         "subject_id": subject_id,
         "title": result.get("title"),
@@ -1123,99 +1117,42 @@ def get_streams(
         "episode": ep,
         "count": len(streams),
         "streams": streams,
-        "downloads": downloads
+        "downloads": downloads,
+        "subtitles": subtitles_obj
     }
-    set_cache(cache_key, res, ttl_sec=300)
+    set_cache(cache_key, res, ttl_sec=600)
     return res
 
-@app.get("/api/stream/{subject_id}/captions", tags=["Streams & Subtitles"], summary="Get English & Auto-Translated Sinhala Subtitles")
-def get_captions(
-    request: Request,
-    subject_id: str = Path(...),
+# ==========================================
+# CACHED SUBTITLE FILE ENDPOINT (10-MIN TTL)
+# ==========================================
+@app.get("/sub/{subject_id}/{lang}.srt", include_in_schema=False)
+async def download_cached_subtitle(
+    subject_id: str,
+    lang: str,
     se: int = Query(0, ge=0),
-    ep: int = Query(0, ge=0),
-    stream_id: Optional[str] = Query(None)
+    ep: int = Query(0, ge=0)
 ):
-    raw_subs = engine.get_raw_subtitles(subject_id, stream_id=stream_id, season=se, episode=ep)
+    if lang not in ("en", "si"):
+        raise HTTPException(status_code=404, detail="Invalid subtitle language. Use en.srt or si.srt")
 
-    # Pick English subtitle only
-    en_sub = None
-    for s in raw_subs:
-        lang_lower = (s.get("language") or "").lower()
-        code_lower = (s.get("code") or "").lower()
-        if code_lower.startswith("en") or "english" in lang_lower:
-            en_sub = s
-            break
+    srt_key = f"srt_file:{lang}:{subject_id}:{se}:{ep}"
+    cached_srt = get_cache(srt_key)
 
-    if not en_sub and raw_subs:
-        en_sub = raw_subs[0]
+    if not cached_srt:
+        en_url = engine.get_english_subtitle_url(subject_id, season=se, episode=ep)
+        if not en_url:
+            raise HTTPException(status_code=404, detail="No subtitle available for this title")
+        en_srt, si_srt = await build_subtitles_from_english(en_url)
+        set_cache(f"srt_file:en:{subject_id}:{se}:{ep}", en_srt, ttl_sec=600)
+        set_cache(f"srt_file:si:{subject_id}:{se}:{ep}", si_srt, ttl_sec=600)
+        cached_srt = en_srt if lang == "en" else si_srt
 
-    filtered_captions = []
-    base_url = str(request.base_url).rstrip("/")
-
-    if en_sub:
-        filtered_captions.append({
-            "language": "English",
-            "code": "en",
-            "auto_translated": False,
-            "url": en_sub["url"],
-            "size": en_sub.get("size"),
-        })
-
-        # Add Auto-Translated Sinhala SRT endpoint
-        si_srt_url = f"{base_url}/api/stream/{subject_id}/captions/sinhala.srt?se={se}&ep={ep}"
-        filtered_captions.append({
-            "language": "Sinhala",
-            "code": "si",
-            "auto_translated": True,
-            "watermark": "APEX API TRANSLATE - POWERED BY MALIYA-MD (00:00:01 - 00:00:03, Yellow)",
-            "url": si_srt_url,
-            "size": None,
-        })
-
-    return {
-        "subject_id": subject_id,
-        "season": se,
-        "episode": ep,
-        "count": len(filtered_captions),
-        "captions": filtered_captions
-    }
-
-@app.get("/api/stream/{subject_id}/captions/sinhala.srt", tags=["Streams & Subtitles"], summary="Download Translated Sinhala .SRT File")
-async def get_sinhala_srt_file(
-    subject_id: str = Path(...),
-    se: int = Query(0, ge=0),
-    ep: int = Query(0, ge=0),
-    stream_id: Optional[str] = Query(None)
-):
-    cache_key = f"si_srt:{subject_id}:{se}:{ep}"
-    cached_srt = get_cache(cache_key)
-    if cached_srt:
-        return Response(
-            content=cached_srt.encode("utf-8"),
-            media_type="application/x-subrip; charset=utf-8",
-            headers={"Content-Disposition": f'attachment; filename="{subject_id}_S{se:02d}E{ep:02d}_si.srt"'}
-        )
-
-    raw_subs = engine.get_raw_subtitles(subject_id, stream_id=stream_id, season=se, episode=ep)
-    en_sub = None
-    for s in raw_subs:
-        if (s.get("code") or "").lower().startswith("en") or "english" in (s.get("language") or "").lower():
-            en_sub = s
-            break
-    if not en_sub and raw_subs:
-        en_sub = raw_subs[0]
-
-    if not en_sub:
-        raise HTTPException(status_code=404, detail="No English subtitle track available to translate into Sinhala.")
-
-    sinhala_srt_content = await translate_srt_to_sinhala(en_sub["url"])
-    set_cache(cache_key, sinhala_srt_content, ttl_sec=3600)
-
+    filename = f"{subject_id}_S{se:02d}E{ep:02d}_{lang}.srt" if (se or ep) else f"{subject_id}_{lang}.srt"
     return Response(
-        content=sinhala_srt_content.encode("utf-8"),
+        content=cached_srt.encode("utf-8"),
         media_type="application/x-subrip; charset=utf-8",
-        headers={"Content-Disposition": f'attachment; filename="{subject_id}_S{se:02d}E{ep:02d}_si.srt"'}
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
     )
 
 @app.get("/movies", tags=["Search & Discovery"], summary="Browse Recommended Movies")
