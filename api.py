@@ -10,7 +10,7 @@ import sys
 import time
 import traceback
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 import httpx
 from fastapi import FastAPI, HTTPException, Path, Query, Request
@@ -34,14 +34,20 @@ if sys.stderr and hasattr(sys.stderr, "reconfigure"):
         pass
 
 API_DESCRIPTION = """
-### MovieBox Developer API (Diagnostic & Testing Edition)
-Every endpoint returns detailed upstream diagnostics (`upstream_status`, `upstream_headers`, `upstream_body`, and `errors`) if an upstream request fails.
+### MovieBox Developer API (v3.2.0)
+
+**Quick 3-Step Workflow:**
+1. **Search:** Call `GET /search?q=Avatar` to get the `subject_id`.
+2. **Resolve Streams:** Call `GET /api/stream/{subject_id}` (add `?se=1&ep=1` for TV series).
+3. **Play or Download:**
+   - Use **`proxy_url`** or **`download_url`** directly in any browser, `<video>` tag, or bot **without needing custom headers** (powered by Cloudflare Edge Proxy).
+   - Or use **`url`** directly with the provided **`headers`** object.
 """
 
 app = FastAPI(
     title="MovieBox Developer API",
     description=API_DESCRIPTION,
-    version="3.1.0",
+    version="3.2.0",
     docs_url="/docs",
     redoc_url="/redoc",
 )
@@ -54,7 +60,7 @@ app.add_middleware(
 )
 
 # ==========================================
-# GLOBAL EXCEPTION HANDLER (Shows exact crash cause)
+# GLOBAL EXCEPTION HANDLER
 # ==========================================
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
@@ -113,8 +119,13 @@ async def rate_limit_middleware(request: Request, call_next):
     return await call_next(request)
 
 # ==========================================
-# CORE ENGINE & SIGNING
+# CONFIGURATION & SIGNING ENGINE
 # ==========================================
+WORKER_PROXY_URL = os.environ.get(
+    "WORKER_PROXY_URL",
+    "https://mbox-proxy.malindunadith52.workers.dev"
+).rstrip("/")
+
 SECRET_KEY_DEFAULT_B64 = "NzZpUmwwN3MweFNOOWpxbUVXQXQ3OUVCSlp1bElRSXNWNjRGWnIyTw=="
 SECRET_KEY_ALT_B64 = "WHFuMm5uTzQxL0w5Mm8xaXVYaFNMSFRiWHZZNFo1Wlo2Mm04bVNMQQ=="
 MODERN_USER_AGENT = "com.community.mbox.in/50020130 (Linux; U; Android 14; en_IN; Pixel 8; Build/UD1A.230803.041; Cronet/145.0.7582.0)"
@@ -478,9 +489,16 @@ class MovieBoxEngine:
 
     def get_streams(self, subject_id: str, season: int = 0, episode: int = 0, detail_path: Optional[str] = None) -> Dict[str, Any]:
         domain_logs = []
-        if not detail_path:
+        clean_title = "movie"
+        try:
             details = self.get_details(subject_id)
-            detail_path = details.get("detail_path", "")
+            if not detail_path:
+                detail_path = details.get("detail_path", "")
+            raw_title = details.get("title") or "movie"
+            clean_title = re.sub(r"[^a-zA-Z0-9_-]", "_", raw_title).strip("_") or "movie"
+        except Exception:
+            if not detail_path:
+                detail_path = ""
 
         token = self.bootstrap_token()
         streams: List[Dict[str, Any]] = []
@@ -518,6 +536,8 @@ class MovieBoxEngine:
                     domain_logs.append({"domain": domain, "status": 200, "reason": "Empty streams array", "upstream_json": json_body})
                     continue
 
+                encoded_ref = quote(f"{domain}/", safe="")
+
                 for st in raw_streams:
                     url = st.get("url")
                     if not url or url in seen_urls:
@@ -531,14 +551,22 @@ class MovieBoxEngine:
                         if str(q) in res_str:
                             quality_val = q
                             break
+
+                    q_label = f"{quality_val}p" if quality_val else res_str
+                    encoded_u = quote(url, safe="")
+                    ep_tag = f"_S{season:02d}E{episode:02d}" if (season or episode) else ""
+                    dl_filename = f"{clean_title}{ep_tag}_{q_label}.mp4"
+
                     streams.append({
-                        "quality": f"{quality_val}p" if quality_val else res_str,
+                        "quality": q_label,
                         "quality_value": quality_val,
                         "format": st.get("format", "MP4"),
                         "size_mb": round(size_mb, 1),
                         "codec": st.get("codecName"),
                         "duration_sec": st.get("duration"),
                         "url": url,
+                        "proxy_url": f"{WORKER_PROXY_URL}/?url={encoded_u}&referer={encoded_ref}",
+                        "download_url": f"{WORKER_PROXY_URL}/?filename={quote(dl_filename)}&url={encoded_u}&referer={encoded_ref}",
                         "headers": {
                             "User-Agent": "Mozilla/5.0",
                             "Referer": f"{domain}/",
@@ -554,6 +582,7 @@ class MovieBoxEngine:
                     if final_url and final_url not in seen_urls:
                         seen_urls.add(final_url)
                         res_tag = str(d.get("resolutions", "adaptive"))
+                        encoded_u = quote(final_url, safe="")
                         streams.append({
                             "quality": "1080p (Adaptive)" if "1080" in res_tag else "Adaptive",
                             "quality_value": 1080 if "1080" in res_tag else 999,
@@ -562,6 +591,7 @@ class MovieBoxEngine:
                             "codec": "hevc/h264",
                             "duration_sec": None,
                             "url": final_url,
+                            "proxy_url": f"{WORKER_PROXY_URL}/?url={encoded_u}&referer={encoded_ref}",
                             "cookie": cookie,
                             "headers": {
                                 "User-Agent": "Mozilla/5.0",
@@ -651,68 +681,317 @@ async def developer_portal():
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>MovieBox Developer API — Docs & Diagnostic Playground</title>
+    <title>MovieBox Developer API — Docs & Playground</title>
     <style>
         :root {
             --bg: #09090b; --surface: #111114; --surface-2: #18181c; --border: #27272a;
-            --text: #fafafa; --dim: #a1a1aa; --blue: #3b82f6; --green: #10b981;
+            --text: #fafafa; --dim: #a1a1aa; --blue: #3b82f6; --blue-soft: rgba(59, 130, 246, 0.14);
+            --green: #10b981; --green-soft: rgba(16, 185, 129, 0.14);
             --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
             --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
         }
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body { background: var(--bg); color: var(--text); font-family: var(--sans); font-size: 14px; line-height: 1.6; padding: 28px 18px 60px; }
-        .container { max-width: 980px; margin: 0 auto; display: flex; flex-direction: column; gap: 24px; }
+        .container { max-width: 1020px; margin: 0 auto; display: flex; flex-direction: column; gap: 26px; }
         header { display: flex; justify-content: space-between; align-items: center; padding-bottom: 18px; border-bottom: 1px solid var(--border); flex-wrap: wrap; gap: 12px; }
-        .btn { background: var(--surface-2); color: var(--text); border: 1px solid var(--border); padding: 7px 14px; border-radius: 6px; font-size: 12px; font-weight: 600; cursor: pointer; text-decoration: none; display: inline-flex; align-items: center; }
+        .title-row { display: flex; align-items: center; gap: 10px; }
+        .title-row h1 { font-size: 20px; font-weight: 700; letter-spacing: -0.4px; }
+        .badge { font-family: var(--mono); font-size: 11px; padding: 3px 8px; border-radius: 5px; background: var(--surface-2); border: 1px solid var(--border); color: var(--dim); }
+        .badge.live { background: var(--green-soft); border-color: rgba(16,185,129,0.3); color: var(--green); }
+        .nav-btns { display: flex; gap: 8px; }
+        .btn { background: var(--surface-2); color: var(--text); border: 1px solid var(--border); padding: 7px 14px; border-radius: 6px; font-size: 12px; font-weight: 600; cursor: pointer; text-decoration: none; display: inline-flex; align-items: center; gap: 6px; transition: 0.15s; }
+        .btn:hover { background: #222228; border-color: #3f3f46; }
         .btn.primary { background: var(--text); color: var(--bg); border: none; }
+        .btn.green { background: var(--green-soft); color: var(--green); border-color: rgba(16,185,129,0.3); }
+        h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.7px; color: var(--dim); margin-bottom: 10px; }
         .card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 20px; }
+        
+        .steps { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px; }
+        .step-box { background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px; padding: 14px; }
+        .step-num { font-family: var(--mono); font-size: 11px; color: var(--blue); font-weight: 700; margin-bottom: 4px; }
+        .step-title { font-weight: 600; font-size: 14px; margin-bottom: 4px; }
+        .step-desc { font-size: 12px; color: var(--dim); }
+        code { font-family: var(--mono); background: #000; padding: 2px 5px; border-radius: 4px; font-size: 12px; color: #e4e4e7; }
+
+        .tabs { display: flex; gap: 6px; margin-bottom: 10px; }
+        .tab { background: transparent; border: 1px solid var(--border); color: var(--dim); padding: 5px 12px; border-radius: 6px; font-size: 12px; cursor: pointer; font-family: var(--mono); }
+        .tab.active { background: var(--blue-soft); border-color: var(--blue); color: var(--blue); font-weight: 600; }
+        pre { background: #070709; border: 1px solid var(--border); border-radius: 8px; padding: 14px; font-family: var(--mono); font-size: 12px; overflow-x: auto; color: #d4d4d8; line-height: 1.5; }
+
+        .controls { display: flex; gap: 8px; flex-wrap: wrap; position: relative; }
+        .input { background: var(--bg); border: 1px solid var(--border); color: var(--text); padding: 10px 14px; border-radius: 7px; font-size: 13px; outline: none; }
+        .input:focus { border-color: var(--blue); }
+        .input.grow { flex: 1; min-width: 220px; }
+        .input.small { width: 75px; }
+        .dropdown { position: absolute; top: 44px; left: 0; right: 0; background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px; max-height: 220px; overflow-y: auto; z-index: 30; display: none; }
+        .drop-item { padding: 10px 14px; cursor: pointer; display: flex; justify-content: space-between; border-bottom: 1px solid var(--border); font-size: 13px; }
+        .drop-item:hover { background: #27272a; }
+        .stream-item { display: flex; justify-content: space-between; align-items: center; padding: 12px 14px; border-bottom: 1px solid var(--border); gap: 10px; flex-wrap: wrap; }
+        .stream-item:last-child { border-bottom: none; }
+
         table { width: 100%; border-collapse: collapse; }
         th, td { padding: 12px 14px; text-align: left; border-bottom: 1px solid var(--border); font-size: 13px; }
         tr:last-child td { border-bottom: none; }
-        code { font-family: var(--mono); background: #000; padding: 2px 6px; border-radius: 4px; font-size: 12px; }
+        th { font-size: 11px; text-transform: uppercase; color: var(--dim); }
+        .method { font-family: var(--mono); font-size: 11px; font-weight: 700; color: var(--green); background: var(--green-soft); padding: 2px 6px; border-radius: 4px; }
     </style>
 </head>
 <body>
 <div class="container">
     <header>
-        <div>
-            <h1 style="font-size: 20px;">MovieBox Developer API <span style="font-size: 12px; color: var(--green);">v3.1.0 (Full Diagnostics)</span></h1>
+        <div class="title-row">
+            <h1>MovieBox Developer API</h1>
+            <span class="badge">v3.2.0</span>
+            <span class="badge live">● Edge Proxy Enabled</span>
         </div>
-        <div style="display: flex; gap: 8px;">
-            <a href="/health" target="_blank" class="btn">Health & TLS Check</a>
+        <div class="nav-btns">
+            <a href="/health" target="_blank" class="btn">Health Status</a>
             <a href="/docs" target="_blank" class="btn primary">Swagger UI ↗</a>
         </div>
     </header>
-    <div class="card" style="padding: 0; overflow-x: auto;">
-        <table>
-            <thead><tr><th>Method</th><th>Endpoint</th><th>Description</th><th style="text-align: right;">Test</th></tr></thead>
-            <tbody>
-                <tr><td><code>GET</code></td><td><code>/health</code></td><td>Verify server status & <code>curl_cffi</code> TLS client</td><td style="text-align: right;"><a href="/health" target="_blank" class="btn">Open</a></td></tr>
-                <tr><td><code>GET</code></td><td><code>/search?q=Avatar</code></td><td>Search titles (shows exact upstream error if blocked)</td><td style="text-align: right;"><a href="/search?q=Avatar" target="_blank" class="btn">Open</a></td></tr>
-                <tr><td><code>GET</code></td><td><code>/detail/8906247916759695608</code></td><td>Metadata & audio dubs</td><td style="text-align: right;"><a href="/detail/8906247916759695608" target="_blank" class="btn">Open</a></td></tr>
-                <tr><td><code>GET</code></td><td><code>/episodes/6207982430134357800</code></td><td>TV seasons & episode counts</td><td style="text-align: right;"><a href="/episodes/6207982430134357800" target="_blank" class="btn">Open</a></td></tr>
-                <tr><td><code>GET</code></td><td><code>/api/stream/8906247916759695608</code></td><td>Stream links + per-domain diagnostic logs</td><td style="text-align: right;"><a href="/api/stream/8906247916759695608" target="_blank" class="btn">Open</a></td></tr>
-                <tr><td><code>GET</code></td><td><code>/api/stream/8906247916759695608/captions</code></td><td>Subtitles (.srt) + error trace</td><td style="text-align: right;"><a href="/api/stream/8906247916759695608/captions" target="_blank" class="btn">Open</a></td></tr>
-                <tr><td><code>GET</code></td><td><code>/movies?page=1</code></td><td>Paginated movie catalog</td><td style="text-align: right;"><a href="/movies?page=1" target="_blank" class="btn">Open</a></td></tr>
-                <tr><td><code>GET</code></td><td><code>/tv-series?page=1</code></td><td>Paginated TV series catalog</td><td style="text-align: right;"><a href="/tv-series?page=1" target="_blank" class="btn">Open</a></td></tr>
-                <tr><td><code>GET</code></td><td><code>/home</code></td><td>Homepage trending & banners</td><td style="text-align: right;"><a href="/home" target="_blank" class="btn">Open</a></td></tr>
-            </tbody>
-        </table>
+
+    <div>
+        <h2>How It Works (3 Simple Steps)</h2>
+        <div class="steps">
+            <div class="step-box">
+                <div class="step-num">STEP 01</div>
+                <div class="step-title">Find Subject ID</div>
+                <div class="step-desc">Search any movie or TV series using <code>/search?q=Avatar</code> to get its <code>subject_id</code>.</div>
+            </div>
+            <div class="step-box">
+                <div class="step-num">STEP 02</div>
+                <div class="step-title">Get Stream Links</div>
+                <div class="step-desc">Call <code>/api/stream/{id}</code> (or <code>?se=1&ep=1</code> for series) to get 1080p, 720p, and 480p links.</div>
+            </div>
+            <div class="step-box">
+                <div class="step-num">STEP 03</div>
+                <div class="step-title">Zero-Header Play & Download</div>
+                <div class="step-desc">Use <code>proxy_url</code> or <code>download_url</code> directly in browsers, HTML5 players, or bots—no headers needed!</div>
+            </div>
+        </div>
+    </div>
+
+    <div>
+        <h2>Quick Copy-Paste Code Examples</h2>
+        <div class="card">
+            <div class="tabs">
+                <button class="tab active" onclick="showCode('js', this)">Node.js / Browser JS</button>
+                <button class="tab" onclick="showCode('py', this)">Python</button>
+                <button class="tab" onclick="showCode('curl', this)">cURL</button>
+            </div>
+            <pre id="codeBlock"></pre>
+        </div>
+    </div>
+
+    <div>
+        <h2>Live API Playground</h2>
+        <div class="card">
+            <div class="controls">
+                <input type="text" id="qInput" class="input grow" placeholder="Type movie/series name (e.g. Avatar) or paste Subject ID..." autocomplete="off">
+                <input type="number" id="seInput" class="input small" placeholder="S" title="Season (0 for Movie)" value="0">
+                <input type="number" id="epInput" class="input small" placeholder="E" title="Episode (0 for Movie)" value="0">
+                <button class="btn primary" onclick="runTest()">Fetch Streams</button>
+                <div id="dropMenu" class="dropdown"></div>
+            </div>
+            <div id="resultArea" style="margin-top: 14px;"></div>
+        </div>
+    </div>
+
+    <div>
+        <h2>Available REST Endpoints</h2>
+        <div class="card" style="padding: 0; overflow-x: auto;">
+            <table>
+                <thead>
+                    <tr>
+                        <th style="width: 75px;">Method</th>
+                        <th>Endpoint</th>
+                        <th>Description</th>
+                        <th style="width: 95px; text-align: right;">Sample</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><span class="method">GET</span></td>
+                        <td><code>/search?q=Avatar</code></td>
+                        <td style="color: var(--dim);">Search movies & TV shows by keyword</td>
+                        <td style="text-align: right;"><a href="/search?q=Avatar" target="_blank" class="btn">Open</a></td>
+                    </tr>
+                    <tr>
+                        <td><span class="method">GET</span></td>
+                        <td><code>/detail/8906247916759695608</code></td>
+                        <td style="color: var(--dim);">Get synopsis, IMDb rating, cover & audio dubs</td>
+                        <td style="text-align: right;"><a href="/detail/8906247916759695608" target="_blank" class="btn">Open</a></td>
+                    </tr>
+                    <tr>
+                        <td><span class="method">GET</span></td>
+                        <td><code>/episodes/6207982430134357800</code></td>
+                        <td style="color: var(--dim);">Get season & episode count for a TV series</td>
+                        <td style="text-align: right;"><a href="/episodes/6207982430134357800" target="_blank" class="btn">Open</a></td>
+                    </tr>
+                    <tr>
+                        <td><span class="method">GET</span></td>
+                        <td><code>/api/stream/8906247916759695608</code></td>
+                        <td style="color: var(--dim);">Get MP4 (1080p/720p/480p), <code>proxy_url</code> & <code>download_url</code></td>
+                        <td style="text-align: right;"><a href="/api/stream/8906247916759695608" target="_blank" class="btn">Open</a></td>
+                    </tr>
+                    <tr>
+                        <td><span class="method">GET</span></td>
+                        <td><code>/api/stream/8906247916759695608/captions</code></td>
+                        <td style="color: var(--dim);">Get multi-language subtitle tracks (.srt)</td>
+                        <td style="text-align: right;"><a href="/api/stream/8906247916759695608/captions" target="_blank" class="btn">Open</a></td>
+                    </tr>
+                    <tr>
+                        <td><span class="method">GET</span></td>
+                        <td><code>/movies?page=1</code></td>
+                        <td style="color: var(--dim);">Browse recommended movies</td>
+                        <td style="text-align: right;"><a href="/movies?page=1" target="_blank" class="btn">Open</a></td>
+                    </tr>
+                    <tr>
+                        <td><span class="method">GET</span></td>
+                        <td><code>/tv-series?page=1</code></td>
+                        <td style="color: var(--dim);">Browse recommended TV series</td>
+                        <td style="text-align: right;"><a href="/tv-series?page=1" target="_blank" class="btn">Open</a></td>
+                    </tr>
+                    <tr>
+                        <td><span class="method">GET</span></td>
+                        <td><code>/home</code></td>
+                        <td style="color: var(--dim);">Homepage banners & trending feeds</td>
+                        <td style="text-align: right;"><a href="/home" target="_blank" class="btn">Open</a></td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
     </div>
 </div>
+
+<script>
+    const BASE = window.location.origin;
+    const snippets = {
+        js: `// Fetch streams for Avatar (or add ?se=1&ep=1 for TV series)
+const res = await fetch("${BASE}/api/stream/8906247916759695608");
+const data = await res.json();
+
+// Pick 720p (or 1080p)
+const stream = data.streams.find(s => s.quality === "720p") || data.streams[0];
+
+// Works directly in browser/video player without custom headers!
+console.log("Stream URL:", stream.proxy_url);
+console.log("Direct Download URL:", stream.download_url);`,
+        py: `import requests
+
+data = requests.get("${BASE}/api/stream/8906247916759695608").json()
+stream = data["streams"][0]
+
+# Download directly via proxy_url (no headers required)
+with requests.get(stream["download_url"], stream=True) as r:
+    with open("movie.mp4", "wb") as f:
+        for chunk in r.iter_content(chunk_size=8192):
+            f.write(chunk)`,
+        curl: `# Fetch JSON response
+curl -s "${BASE}/api/stream/8906247916759695608" | jq .`
+    };
+
+    function showCode(lang, btn) {
+        document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+        if (btn) btn.classList.add('active');
+        document.getElementById('codeBlock').textContent = snippets[lang];
+    }
+    showCode('js');
+
+    let timer = null;
+    let selectedId = "";
+    const qInput = document.getElementById("qInput");
+    const dropMenu = document.getElementById("dropMenu");
+
+    qInput.addEventListener("input", (e) => {
+        clearTimeout(timer);
+        const val = e.target.value.trim();
+        if (val.length < 2) { dropMenu.style.display = "none"; return; }
+        if (/^\\d{15,}$/.test(val)) { selectedId = val; dropMenu.style.display = "none"; return; }
+        timer = setTimeout(async () => {
+            try {
+                const res = await fetch(`/search/suggest?q=${encodeURIComponent(val)}`);
+                const data = await res.json();
+                const items = data.suggestions || [];
+                if (!items.length) { dropMenu.style.display = "none"; return; }
+                dropMenu.innerHTML = items.map(i => `
+                    <div class="drop-item" onclick="pick('${i.subject_id}', '${i.title.replace(/'/g, "\\\\'")}')">
+                        <span>${i.title}</span>
+                        <span style="font-family: var(--mono); color: var(--dim); font-size: 11px;">${i.subject_id}</span>
+                    </div>
+                `).join("");
+                dropMenu.style.display = "block";
+            } catch (e) {}
+        }, 250);
+    });
+
+    function pick(id, title) {
+        selectedId = id;
+        qInput.value = title;
+        dropMenu.style.display = "none";
+        runTest();
+    }
+
+    async function runTest() {
+        const val = qInput.value.trim();
+        const id = /^\\d{15,}$/.test(val) ? val : (selectedId || val);
+        const se = parseInt(document.getElementById("seInput").value) || 0;
+        const ep = parseInt(document.getElementById("epInput").value) || 0;
+        if (!id) return;
+
+        const area = document.getElementById("resultArea");
+        area.innerHTML = '<div style="color: var(--dim);">Resolving streams...</div>';
+
+        try {
+            const endpoint = `/api/stream/${id}?se=${se}&ep=${ep}`;
+            const res = await fetch(endpoint);
+            const data = await res.json();
+            if (!res.ok) {
+                area.innerHTML = `<pre style="color: #fca5a5;">${JSON.stringify(data, null, 2)}</pre>`;
+                return;
+            }
+            const streams = data.streams || [];
+            area.innerHTML = `
+                <div style="margin-bottom: 10px; display: flex; justify-content: space-between; align-items: center;">
+                    <span style="font-family: var(--mono); font-size: 12px; color: var(--green);">GET ${endpoint} (${streams.length} streams)</span>
+                    <a href="${endpoint}" target="_blank" class="btn">View Full JSON ↗</a>
+                </div>
+                <div style="border: 1px solid var(--border); border-radius: 8px; background: var(--bg);">
+                    ${streams.map(s => `
+                        <div class="stream-item">
+                            <div style="display: flex; align-items: center; gap: 10px;">
+                                <span class="badge live">${s.quality}</span>
+                                <strong>${s.format}</strong>
+                                <span style="color: var(--dim); font-size: 12px;">${s.size_mb ? s.size_mb + ' MB' : 'Adaptive'}</span>
+                            </div>
+                            <div style="display: flex; gap: 6px;">
+                                <a href="${s.proxy_url}" target="_blank" class="btn">Play in Browser</a>
+                                ${s.download_url ? `<a href="${s.download_url}" class="btn green">Download</a>` : ''}
+                                <button class="btn" onclick="navigator.clipboard.writeText('${s.proxy_url}'); alert('Proxy Stream URL Copied!')">Copy Link</button>
+                            </div>
+                        </div>
+                    `).join("")}
+                </div>
+            `;
+        } catch (err) {
+            area.innerHTML = `<div style="color: #ef4444;">Request failed: ${err.message}</div>`;
+        }
+    }
+</script>
 </body>
 </html>"""
     return HTMLResponse(content=html_content)
 
 # ==========================================
-# PUBLIC REST ENDPOINTS (WITH FULL ERROR REPORTING)
+# PUBLIC REST ENDPOINTS
 # ==========================================
-@app.get("/health", tags=["System"], summary="Check API Server Health & TLS Client")
+@app.get("/health", tags=["System"], summary="Check API Server Health & Proxy Config")
 def health_check():
     return {
         "status": "ok",
-        "version": "3.1.0",
-        "tls_client": "curl_cffi (chrome120)" if cr is not None else "httpx (fallback - no TLS impersonation)",
+        "version": "3.2.0",
+        "tls_client": "curl_cffi (chrome120)" if cr is not None else "httpx (fallback)",
+        "edge_proxy": WORKER_PROXY_URL,
         "cached_entries": len(RESPONSE_CACHE),
         "rate_limit_per_min": MAX_REQ_PER_MIN
     }
@@ -787,7 +1066,7 @@ def get_episodes(subject_id: str = Path(...)):
     set_cache(cache_key, res, ttl_sec=900)
     return res
 
-@app.get("/api/stream/{subject_id}", tags=["Streams & Subtitles"], summary="Resolve Direct MP4 & DASH Stream Links")
+@app.get("/api/stream/{subject_id}", tags=["Streams & Subtitles"], summary="Resolve MP4 & DASH Stream Links (With Proxy URLs)")
 def get_streams(
     subject_id: str = Path(...),
     se: int = Query(0, ge=0),
