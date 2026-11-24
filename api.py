@@ -46,7 +46,7 @@ API_DESCRIPTION = """
 app = FastAPI(
     title="APEX API — MovieBox Stream & Subtitle Engine",
     description=API_DESCRIPTION,
-    version="3.7.0",
+    version="3.7.1",
     docs_url="/docs",
     redoc_url="/redoc",
 )
@@ -122,7 +122,7 @@ async def rate_limit_middleware(request: Request, call_next):
 # ==========================================
 SECRET_KEY_DEFAULT_B64 = "NzZpUmwwN3MweFNOOWpxbUVXQXQ3OUVCSlp1bElRSXNWNjRGWnIyTw=="
 SECRET_KEY_ALT_B64 = "WHFuMm5uTzQxL0w5Mm8xaXVYaFNMSFRiWHZZNFo1Wlo2Mm04bVNMQQ=="
-MODERN_USER_AGENT = "com.community.mbox.in/50020130 (Linux; U; Android 14; en_IN; Pixel 8; Build/UD1A.230803.041; Cronet/145.0.7582.0)"
+MODERN_USER_AGENT = "com.community.mbox.in/50020130 (Linux; U; Android 14; en_US; Pixel 8; Build/UD1A.230803.041; Cronet/145.0.7582.0)"
 WEB_USER_AGENT = "Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Mobile Safari/537.36"
 API_BASE = "https://h5-api.aoneroom.com/wefeed-h5api-bff"
 NATIVE_API_BASE = "https://api3.aoneroom.com"
@@ -176,8 +176,8 @@ def generate_client_info(device_id: str) -> str:
             "model": "Pixel 8",
             "system_language": "en",
             "net": "NETWORK_WIFI",
-            "region": "IN",
-            "timezone": "Asia/Calcutta",
+            "region": "US",
+            "timezone": "America/New_York",
             "sp_code": "",
         },
         separators=(",", ":"),
@@ -385,6 +385,17 @@ class MovieBoxEngine:
             cls._instance = MovieBoxEngine()
         return cls._instance
 
+    @staticmethod
+    def _is_dummy_stream(url: str, size_bytes: int) -> bool:
+        if not url:
+            return True
+        # MovieBox decoy/placeholder clips (~0.8 MB) are hosted under /other/
+        if "/other/" in url:
+            return True
+        if 0 < size_bytes < 5 * 1024 * 1024:
+            return True
+        return False
+
     def bootstrap_token(self, force: bool = False) -> str:
         if self.bearer_token and not force:
             return self.bearer_token
@@ -542,7 +553,11 @@ class MovieBoxEngine:
         if not data:
             raise HTTPException(status_code=404, detail={"error": "Title not found", "subject_id": subject_id})
         detail_url_str = data.get("detailUrl", "")
-        detail_path = detail_url_str.split("/")[-1] if "/" in detail_url_str else detail_url_str
+        detail_path = (
+            data.get("detailPath")
+            or (detail_url_str.split("/")[-1].split("?")[0] if "/" in detail_url_str else detail_url_str)
+            or ""
+        )
         sub_cover = data.get("cover")
         return {
             "subject_id": str(data.get("subjectId")),
@@ -594,135 +609,116 @@ class MovieBoxEngine:
         ]
 
     def _fetch_streams_single_target(self, target_id: str, season: int, episode: int, detail_path: str, domain_logs: list) -> Tuple[List[Dict[str, Any]], Optional[str]]:
-        token = self.bootstrap_token()
         streams: List[Dict[str, Any]] = []
         seen_urls = set()
         primary_stream_id: Optional[str] = None
 
-        # 1. Try Web H5 BFF Domains
-        for domain in WEB_DOMAINS:
-            play_url = (
-                f"{domain}/wefeed-h5api-bff/subject/play?"
-                f"subjectId={target_id}&se={season}&ep={episode}&detailPath={detail_path}&"
-                f"streamSignType=1&supportCodecs%5Bhevc%5D=1&supportCodecs%5Bh264%5D=1"
-            )
+        # 1. Try Web H5 Download & Play Endpoints (Best for Anime MP4s)
+        for domain in WEB_DOMAINS[:5]:
             if season > 0 or episode > 0:
                 referer = f"{domain}/series/{detail_path}?id={target_id}&type=/series/detail&detailSe={season}&detailEp={episode}&lang=en"
             else:
-                referer = f"{domain}/movies/{detail_path}?id={target_id}&type=/movie/detail&detailSe=&detailEp=&lang=en"
+                referer = f"{domain}/movies/{detail_path}?id={target_id}&type=/movie/detail&lang=en"
 
-            headers = {
+            h5_headers = {
                 "User-Agent": WEB_USER_AGENT,
                 "Referer": referer,
+                "Origin": domain,
                 "Accept": "application/json",
-                "x-client-info": '{"timezone":"Asia/Calcutta"}',
+                "x-client-info": '{"timezone":"America/New_York"}',
                 "x-request-lang": "en",
-                "x-vip-restrict": "0",
-                "x-no-high-risk-restrict": "0",
                 "x-source": "moviebox",
-                "Authorization": f"Bearer {token}",
             }
-            try:
-                resp = self.session.get(play_url, headers=headers, timeout=12)
-                if resp.status_code != 200:
-                    domain_logs.append({"domain": domain, "target_id": target_id, "status": resp.status_code})
-                    continue
-                json_body = resp.json()
-                data = json_body.get("data", {})
-                raw_streams = data.get("streams", [])
-                dash_items = data.get("dash", [])
-
-                if not raw_streams and not dash_items:
-                    domain_logs.append({"domain": domain, "target_id": target_id, "reason": "Empty streams"})
-                    continue
-
-                for st in raw_streams:
-                    if not primary_stream_id and st.get("id"):
-                        primary_stream_id = str(st["id"])
-                    url = st.get("url")
-                    if not url or url in seen_urls:
+            candidate_urls = [
+                f"{domain}/wefeed-h5api-bff/subject/download?subjectId={target_id}&se={season}&ep={episode}",
+                f"{domain}/wefeed-h5api-bff/subject/play?subjectId={target_id}&se={season}&ep={episode}&detailPath={detail_path}",
+            ]
+            for play_url in candidate_urls:
+                try:
+                    resp = self.session.get(play_url, headers=h5_headers, timeout=12)
+                    if resp.status_code != 200:
+                        domain_logs.append({"domain": domain, "target_id": target_id, "status": resp.status_code})
                         continue
-                    seen_urls.add(url)
-                    res_str = str(st.get("resolutions", "unknown"))
-                    size_bytes = int(st.get("size") or 0)
-                    size_mb = round(size_bytes / (1024 * 1024), 1) if size_bytes else 0
-                    quality_val = 0
-                    for q in (2160, 1440, 1080, 720, 480, 360, 240):
-                        if str(q) in res_str:
-                            quality_val = q
-                            break
+                    data = resp.json().get("data", {})
+                    raw_streams = data.get("streams") or data.get("downloads") or []
+                    dash_items = data.get("dash", [])
 
-                    q_label = f"{quality_val}p" if quality_val else res_str
-                    streams.append({
-                        "quality": q_label,
-                        "quality_value": quality_val,
-                        "format": st.get("format", "MP4"),
-                        "size": format_human_size(size_bytes),
-                        "size_mb": size_mb,
-                        "codec": st.get("codecName"),
-                        "duration_sec": st.get("duration"),
-                        "dl_link": url,
-                        "headers": {
-                            "User-Agent": "Mozilla/5.0",
-                            "Referer": f"{domain}/",
-                            "Origin": domain,
-                        }
-                    })
-
-                for d in dash_items:
-                    if not primary_stream_id and d.get("id"):
-                        primary_stream_id = str(d["id"])
-                    url = d.get("url")
-                    cookie = d.get("signCookie")
-                    extracted_mpd = extract_policy_resource(cookie) if cookie else None
-                    final_url = extracted_mpd or url
-                    if final_url and final_url not in seen_urls:
-                        seen_urls.add(final_url)
-                        res_tag = str(d.get("resolutions", "adaptive"))
+                    for st in raw_streams:
+                        url = st.get("url")
+                        size_bytes = int(st.get("size") or 0)
+                        if self._is_dummy_stream(url, size_bytes) or url in seen_urls:
+                            continue
+                        if not primary_stream_id and st.get("id"):
+                            primary_stream_id = str(st["id"])
+                        seen_urls.add(url)
+                        res_str = str(st.get("resolutions") or st.get("resolution") or "unknown")
+                        size_mb = round(size_bytes / (1024 * 1024), 1) if size_bytes else 0
+                        quality_val = next((q for q in (2160, 1440, 1080, 720, 480, 360, 240) if str(q) in res_str), 0)
                         streams.append({
-                            "quality": "1080p (Adaptive)" if "1080" in res_tag else "Adaptive",
-                            "quality_value": 1080 if "1080" in res_tag else 999,
-                            "format": "DASH",
-                            "size": "Adaptive",
-                            "size_mb": 0,
-                            "codec": "hevc/h264",
-                            "duration_sec": None,
-                            "dl_link": final_url,
-                            "cookie": cookie,
+                            "quality": f"{quality_val}p" if quality_val else res_str,
+                            "quality_value": quality_val,
+                            "format": st.get("format", "MP4"),
+                            "size": format_human_size(size_bytes),
+                            "size_mb": size_mb,
+                            "codec": st.get("codecName"),
+                            "duration_sec": st.get("duration"),
+                            "dl_link": url,
                             "headers": {
-                                "User-Agent": "Mozilla/5.0",
+                                "User-Agent": WEB_USER_AGENT,
                                 "Referer": f"{domain}/",
                                 "Origin": domain,
                             }
                         })
-                if streams:
-                    return streams, primary_stream_id
-            except Exception as e:
-                domain_logs.append({"domain": domain, "target_id": target_id, "exception": str(e)})
-                continue
 
-        # 2. Fallback to Native Android Mobile API (Fixes Anime restricted on Web H5)
+                    for d in dash_items:
+                        url = d.get("url")
+                        cookie = d.get("signCookie")
+                        final_url = (extract_policy_resource(cookie) if cookie else None) or url
+                        if final_url and not self._is_dummy_stream(final_url, 0) and final_url not in seen_urls:
+                            if not primary_stream_id and d.get("id"):
+                                primary_stream_id = str(d["id"])
+                            seen_urls.add(final_url)
+                            res_tag = str(d.get("resolutions", "adaptive"))
+                            streams.append({
+                                "quality": "1080p (Adaptive)" if "1080" in res_tag else "Adaptive",
+                                "quality_value": 1080 if "1080" in res_tag else 999,
+                                "format": "DASH",
+                                "size": "Adaptive",
+                                "size_mb": 0,
+                                "codec": "hevc/h264",
+                                "duration_sec": None,
+                                "dl_link": final_url,
+                                "cookie": cookie,
+                                "headers": {
+                                    "User-Agent": WEB_USER_AGENT,
+                                    "Referer": f"{domain}/",
+                                    "Origin": domain,
+                                }
+                            })
+                    if streams:
+                        return streams, primary_stream_id
+                except Exception as e:
+                    domain_logs.append({"domain": domain, "target_id": target_id, "exception": str(e)})
+                    continue
+
+        # 2. Fallback to Native Android Mobile API (Filtering <5MB dummy streams)
         try:
             native_url = f"/wefeed-mobile-bff/subject-api/play-info?subjectId={target_id}&se={season}&ep={episode}"
             native_data = self.api_request("GET", native_url).get("data", {})
             for st in native_data.get("streams", []):
+                url = st.get("url")
+                size_bytes = int(st.get("size") or 0)
+                if self._is_dummy_stream(url, size_bytes) or url in seen_urls:
+                    domain_logs.append({"source": "native_dummy_filtered", "target_id": target_id, "size": size_bytes})
+                    continue
                 if not primary_stream_id and st.get("id"):
                     primary_stream_id = str(st["id"])
-                url = st.get("url")
-                if not url or url in seen_urls:
-                    continue
                 seen_urls.add(url)
                 res_str = str(st.get("resolutions", "unknown"))
-                size_bytes = int(st.get("size") or 0)
                 size_mb = round(size_bytes / (1024 * 1024), 1) if size_bytes else 0
-                quality_val = 0
-                for q in (2160, 1440, 1080, 720, 480, 360, 240):
-                    if str(q) in res_str:
-                        quality_val = q
-                        break
-                q_label = f"{quality_val}p" if quality_val else res_str
+                quality_val = next((q for q in (2160, 1440, 1080, 720, 480, 360, 240) if str(q) in res_str), 0)
                 streams.append({
-                    "quality": q_label,
+                    "quality": f"{quality_val}p" if quality_val else res_str,
                     "quality_value": quality_val,
                     "format": st.get("format", "MP4"),
                     "size": format_human_size(size_bytes),
@@ -737,13 +733,12 @@ class MovieBoxEngine:
                 })
 
             for h in native_data.get("hls", []) + native_data.get("dash", []):
-                if not primary_stream_id and h.get("id"):
-                    primary_stream_id = str(h["id"])
                 url = h.get("url")
                 cookie = h.get("signCookie")
-                extracted_mpd = extract_policy_resource(cookie) if cookie else None
-                final_url = extracted_mpd or url
-                if final_url and final_url not in seen_urls:
+                final_url = (extract_policy_resource(cookie) if cookie else None) or url
+                if final_url and not self._is_dummy_stream(final_url, 0) and final_url not in seen_urls:
+                    if not primary_stream_id and h.get("id"):
+                        primary_stream_id = str(h["id"])
                     seen_urls.add(final_url)
                     streams.append({
                         "quality": "1080p (Adaptive)",
@@ -771,7 +766,7 @@ class MovieBoxEngine:
         dubs = []
         try:
             details = self.get_details(subject_id)
-            if detail_path is None:
+            if not detail_path:
                 detail_path = details.get("detail_path", "")
             title = details.get("title")
             dubs = details.get("dubs", [])
@@ -962,7 +957,7 @@ async def developer_portal():
     <header>
         <div class="title-row">
             <h1>APEX API</h1>
-            <span class="badge">v3.7.0</span>
+            <span class="badge">v3.7.1</span>
             <span class="badge live">● Movies + Anime + Batch TV Series</span>
             <span class="badge si">● EN + Sinhala SRT (10m Cache)</span>
         </div>
@@ -1044,7 +1039,7 @@ def health_check():
     return {
         "status": "ok",
         "api": "APEX API",
-        "version": "3.7.0",
+        "version": "3.7.1",
         "tls_client": "curl_cffi (chrome120)" if cr is not None else "httpx (fallback)",
         "cached_entries": len(RESPONSE_CACHE),
         "rate_limit_per_min": MAX_REQ_PER_MIN
